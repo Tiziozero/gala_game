@@ -1,0 +1,15 @@
+import "core/rl.gala";
+import "core/core.gala";
+
+struct Entity {
+    id: int,
+    pos, dir: Vector2,
+}
+struct Message {
+    kind: int,
+    data: union {
+        connect: struct {
+            id: int,
+        },
+    }
+}

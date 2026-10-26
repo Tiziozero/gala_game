@@ -1,0 +1,100 @@
+import "core/rl.gala";
+import "core/core.gala";
+import "core/mem.gala";
+import "core/cfunctions.gala";
+import "core/threads.gala";
+import "./common.gala";
+
+
+I := Matrix { [16]f32{1, 0, 0, 0,
+0, 1, 0, 0,
+0, 0, 1, 0,
+0, 0, 0, 1,} };
+
+struct State {
+    state_mutex: Mutex,
+    entities: []Entity,
+}
+
+fn main() {
+    init_arena := arena_make(1024*1024); // 1MB
+    allocator := arena_allocator(&init_arena);
+    s := new::<State>(allocator);
+    s^.entities = make_slice::<Entity>(10, allocator)[:];
+    mutex_init(&s^.state_mutex);
+
+    InitWindow(800, 500, clone_cstring("Hello, Raylib!", allocator));
+    SetTargetFPS(60);
+
+    model_path := "./duck.obj";
+    model := LoadModel(clone_cstring(model_path, allocator));
+    camera := Camera3D {
+        position = { 5.0, 4.0, 5.0 },
+        target = { 0.0, 0.0, 0.0 },
+        up = {0.0, 1.0, 0.0 },
+        fovy = 45.0,
+        projection = 0, // "CAMERA_PERSPECTIVE" in reaylib header is 0
+    };
+
+    v := Vector2 { 0, 0 };
+    p := Vector2 { 0, 0 };
+    last_d := v;
+
+    camabc := Vector3 {
+            cosf(45*PI/180) * cosf(35*PI/180),
+            sinf(35*PI/180),
+            -sinf(45*PI/180) * cosf(35*PI/180),
+    };
+    while !WindowShouldClose() {
+        v = { 0, 0 };
+        if IsKeyDown(KEY_UP) {
+            v.y += 1;
+        }
+        if IsKeyDown(KEY_DOWN) {
+            v.y -= 1;
+        }
+        if IsKeyDown(KEY_LEFT) {
+            v.x -= 1;
+        }
+        if IsKeyDown(KEY_RIGHT) {
+            v.x += 1;
+        }
+        if v.x != 0 || v.y != 0 {
+            v = Vector2Normalize(v);
+        }
+        v = Vector2Rotate(v, -PI/4);
+        dt := GetFrameTime();
+        p.x += dt*2*v.x;
+        p.y += dt*2*v.y;
+        if v.x != 0 || v.y != 0 {
+            last_d = v;
+        }
+        
+        d := -atan2f(last_d.x, last_d.y) / (PI / 2);
+        d = roundf(d * 2) / 2;
+
+        if d < 0 {
+            d += 4;
+        }
+        model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* d));
+        // target and some bullshit going on here.
+        camera.position.x = 5*camabc.x + -p.x;
+        camera.position.y = 5*camabc.y;
+        camera.position.z = 5*camabc.z + p.y;
+        camera.target.x = -p.x;
+        camera.target.y = 0;
+        camera.target.z =  p.y;
+
+        BeginDrawing();
+        ClearBackground({0,0,0,255});
+        BeginMode3D(camera);
+        DrawGrid(20, 1.0);
+        DrawModel(model, {-p.x, 0, p.y}, 1.5, {255, 255, 255, 255});
+        EndMode3D();
+        DrawFPS(10, 10);
+        EndDrawing();
+    }
+    CloseWindow();
+    mutex_destroy(&s^.state_mutex);
+    arena_destroy(&init_arena);
+}

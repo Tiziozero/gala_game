@@ -1,0 +1,59 @@
+import "core/core.gala";
+import "core/net.gala";
+import "core/cfunctions.gala";
+import "core/threads.gala";
+import "core/mem.gala";
+import "./common.gala";
+
+struct Client {
+    actieve: bool,
+    socket: TcpSocket,
+    entity: Entity,
+}
+struct State {
+    state_mutex: Mutex,
+    clients: [1024]Client,
+}
+
+struct hc_payload { clients_socket: TcpSocket, s: ^State }
+fn handle_client(payload: ^hc_payload) {
+    client_socket := payload^.clients_socket;
+    s := payload^.s;
+
+    println("fd:", client_socket.fd);
+
+    tcp_send(client_socket, transmute([]byte)("Hello, Client!"));
+
+    free(cast(rawptr)payload);
+    println("closed fd:", client_socket.fd);
+    kill_client(Client{ false, client_socket});
+}
+
+fn kill_client(c: Client) {
+    tcp_shutdown(c.socket, SHUT_RDWR);
+    tcp_close(c.socket);
+}
+
+fn main() {
+    listener := tcp_listen(1234, 10);
+    s := new::<State>();
+
+    on := true;
+    while on  {
+        println("Accepting connection.");
+        c := tcp_accept(listener);
+        if c.fd < 0 {
+            println("Error in receiving.");
+            println("Ignoring.");
+            continue;
+        }
+        payload := new::<hc_payload>();
+        payload^.clients_socket = c;
+        payload^.s = s;
+        thread_spawn(handle_client, payload);
+    }
+    
+    free(cast(rawptr)s);
+    println("Closing listener.");
+    tcp_close(listener);
+}

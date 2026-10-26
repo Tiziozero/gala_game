@@ -1,0 +1,13 @@
+import "core/mem.gala";
+import "core/core.gala";
+
+struct ConnectMsg {
+    as: int,
+}
+struct Message {
+    kind: int,
+    connect: ConnectMsg,
+}
+
+fn parse_message(data: []byte): Message {
+}
