@@ -1,15 +1,58 @@
 import "core/rl.gala";
+import "core/mem.gala";
+import "core/buffer_io.gala";
 import "core/core.gala";
 
 struct Entity {
     id: int,
     pos, dir: Vector2,
 }
+MK_CONNECT  :: 1<<0;
+MK_STATE    :: 1<<1;
+MK_UPDATE   :: 1<<2;
 struct Message {
     kind: int,
     data: union {
         connect: struct {
             id: int,
         },
+        state: struct {
+            entities: []Entity,
+        },
+        update: struct {
+            pos, dir: Vector2,
+        },
     }
+}
+
+fn pack_entities(entities: []Entity, buffer: ^Buffer): bool {
+    b := buffer;
+    if !buffer_write(b, cast(i64)len(entities)) { return false; }
+    for e in entities {
+        if !buffer_write(b, e.id) { return false; }
+        if !buffer_write(b, e.pos.x) { return false; }
+        if !buffer_write(b, e.pos.y) { return false; }
+        if !buffer_write(b, e.dir.x) { return false; }
+        if !buffer_write(b, e.dir.y) { return false; }
+    }
+    return true;
+}
+
+fn unpack_entities(b: ^Buffer, entities: ^[]Entity, allocator := base_allocator): bool {
+    l: i64 = -1;
+    if !buffer_read(b, &l) { return false; }
+    data := make_slice::<Entity>(l, allocator);
+    i := 0;
+    while i < l {
+        e := Entity{ 0, { 0, 0 }, { 0, 0 } };
+        if !buffer_read(b, &e.id)  { return false; }
+        if !buffer_read(b, &e.pos.x)  { return false; }
+        if !buffer_read(b, &e.pos.y)  { return false; }
+        if !buffer_read(b, &e.dir.x)  { return false; }
+        if !buffer_read(b, &e.dir.y)  { return false; }
+        data[i] = e;
+        i += 1;
+    }
+    entities^ = data;
+    return true;
 }

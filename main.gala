@@ -3,6 +3,7 @@ import "core/net.gala";
 import "core/cfunctions.gala";
 import "core/threads.gala";
 import "core/mem.gala";
+import "core/buffer_io.gala";
 import "./common.gala";
 
 struct Client {
@@ -25,10 +26,14 @@ fn handle_client(payload: ^hc_payload) {
 
     println("fd:", client_socket.fd);
 
-    tcp_send(client_socket, transmute([]byte)("Hello, Client!"));
-
+    b := buffer_make(64);
+    buffer_write_string(&b, "Hello");
+    tcp_send(client_socket, buffer_slice(&b));
+    
+    buffer_destroy(&b);
+    clinet := Client{true, -1, client_socket, -1};
+    e := Entity{-1, {0,0}, {0,0}};
     free(cast(rawptr)payload);
-    println("closed fd:", client_socket.fd);
 }
 
 fn insert_client(s: ^State, c: Client, e: Entity): struct { r: bool, id: int}  {
@@ -40,8 +45,11 @@ fn insert_client(s: ^State, c: Client, e: Entity): struct { r: bool, id: int}  {
         if v.active { i += 1; continue; }
         nc := c;
         nc.entity_id = i; // entity id. not really needed cus should be the same. or nah not really. yeah
+        ne := e;
+        ne.id = i;
+
         s^.clients[i] = nc;
-        s^.entities[i] = e;
+        s^.entities[i] = ne;
         return {true, i};
     }
     return {false, 0};
@@ -57,9 +65,11 @@ fn remove_client(s: ^State, c: Client): struct { r: bool, id: int} {
     }
     return {false, 0};
 }
-fn kill_client(c: Client) {
+fn kill_client(s: ^State, c: Client) {
+    remove_client(s, c);
     tcp_shutdown(c.socket, SHUT_RDWR);
     tcp_close(c.socket);
+    println("closed client:", c.id, c.socket.fd);
 }
 
 fn main() {
