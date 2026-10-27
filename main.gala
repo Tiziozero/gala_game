@@ -17,6 +17,7 @@ struct State {
     clients:        [1024]Client,
     ccount:         int,
     entities:       [1024]Entity,
+    on:             bool,
 }
 
 struct hc_payload { clients_socket: TcpSocket, s: ^State }
@@ -28,14 +29,54 @@ fn handle_client(payload: ^hc_payload) {
 
     b := buffer_make(64);
     buffer_write_string(&b, "Hello");
-    tcp_send(client_socket, buffer_slice(&b));
+    // no pipe
+    tcp_send(client_socket, buffer_slice(&b), flags=0x4000);
     
     buffer_destroy(&b);
-    clinet := Client{true, -1, client_socket, -1};
-    e := Entity{-1, {0,0}, {0,0}};
+    c := Client{true, -1, client_socket, -1};
+    e := Entity{true, -1, {0,0}, {0,0}, 0};
+    nc := insert_client(s, c, e);
+
+
+    c = s^.clients[nc.id];
+    rb := [1024]byte{};
+    frame_arena := arena_make(1024*16);
+    while true {
+        n := tcp_recv(c.socket, rb[:]);
+        if n <= 0 {
+            println("revceived {} bytes from client. killing.", n);
+            remove_client(s, c);
+            break;
+        }
+        bf := buffer_wrap(rb[:n]);
+        m := Message{0, { nufin = 0 }};
+        if !unpack_message(&bf,&m, arena_allocator(&frame_arena)) {
+            println("failed to unpack message");
+            remove_client(s, c);
+            break;
+        }
+        if m.kind == MK_UPDATE {
+            mutex_lock(&s^.state_mutex);
+            s^.entities[c.entity_id].pos = m.data.update.pos;
+            s^.entities[c.entity_id].dir = m.data.update.dir;
+            s^.entities[c.entity_id].d = m.data.update.d;
+            mutex_unlock(&s^.state_mutex);
+        }
+    }
+    arena_destroy(&frame_arena);
     free(cast(rawptr)payload);
 }
 
+fn find_client(s: ^State, id: int): struct { r: bool, id: int } {
+    i := 0;
+    for c in s^.clients {
+        if c.active && c.id == id {
+            return {true, i};
+        }
+        i += 1;
+    }
+    return {false, -1};
+}
 fn insert_client(s: ^State, c: Client, e: Entity): struct { r: bool, id: int}  {
     if s^.ccount >= len(s^.clients) {
         return {false, 0};
@@ -50,15 +91,19 @@ fn insert_client(s: ^State, c: Client, e: Entity): struct { r: bool, id: int}  {
 
         s^.clients[i] = nc;
         s^.entities[i] = ne;
+        s^.ccount += 1;
         return {true, i};
     }
     return {false, 0};
 }
 
 fn remove_client(s: ^State, c: Client): struct { r: bool, id: int} {
+    if s^.ccount <= 0 { return {false, -1}; }
     i := 0; for v in s^.clients {
         if v.id == c.id {
             s^.clients[i].active = false;
+            s^.entities[c.entity_id].active = false;
+            s^.ccount -= 1;
             return {true, i};
         }
         i += 1;
@@ -72,12 +117,51 @@ fn kill_client(s: ^State, c: Client) {
     println("closed client:", c.id, c.socket.fd);
 }
 
+
+fn sender_thread(s: ^State) {
+    entities := [1024]Entity{};
+    b := buffer_make(1024);
+    while s^.on {
+        sleep_ms(10);
+        if s^.ccount <= 0 {
+            continue;
+        }
+        mutex_lock(&s^.state_mutex);
+        l := 0;
+        for e in s^.entities {
+            if e.active {
+                entities[l] = e;
+                l += 1;
+            }
+        }
+        mutex_unlock(&s^.state_mutex);
+        msg := Message { MK_STATE, { state = { entities[:l] } } };
+        if !pack_message(msg, &b) {
+            println("failed to pack message");
+            buffer_clear(&b);
+            return;
+        }
+        for c in s^.clients {
+            if !c.active { continue; }
+            n := tcp_send(c.socket, buffer_slice(&b), flags=0x4000);
+            if n != b.length {
+                kill_client(s, c);
+                println("failed to send all bytes to", c.id);
+                continue;
+            }
+        }
+        buffer_clear(&b);
+    }
+}
+
 fn main() {
     listener := tcp_listen(1234, 10);
     s := new::<State>();
 
-    on := true;
-    while on  {
+    st := thread_spawn(sender_thread, s);
+
+    s^.on = true;
+    while s^.on  {
         println("Accepting connection.");
         c := tcp_accept(listener);
         if c.fd < 0 {
@@ -90,6 +174,7 @@ fn main() {
         payload^.s = s;
         thread_spawn(handle_client, payload);
     }
+    thread_join(st);
     
     free(cast(rawptr)s);
     println("Closing listener.");

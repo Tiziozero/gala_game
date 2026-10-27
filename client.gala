@@ -1,8 +1,10 @@
 import "core/rl.gala";
+import "core/net.gala";
 import "core/core.gala";
 import "core/mem.gala";
 import "core/cfunctions.gala";
 import "core/threads.gala";
+import "core/buffer_io.gala";
 import "./common.gala";
 
 
@@ -12,19 +14,115 @@ I := Matrix { [16]f32{1, 0, 0, 0,
 0, 0, 0, 1,} };
 
 struct State {
-    state_mutex: Mutex,
-    entities: []Entity,
+    state_mutex:    Mutex,
+    server_conn:    TcpSocket,
+    entities:       []Entity,
+    entity_capacity, entity_count: i64,
+    on:             bool,
 }
 
+fn replace_entities(s: ^State, incoming: []Entity) {
+    mutex_lock(&s^.state_mutex);
+
+    count := len(incoming);
+
+    if count > s^.entity_capacity {
+        new_capacity := s^.entity_capacity;
+        if new_capacity < 16 {
+            new_capacity = 16;
+        }
+
+        while new_capacity < count {
+            new_capacity *= 2;
+        }
+
+        new_entities := make_slice::<Entity>(
+            new_capacity,
+            heap_allocator(),
+        );
+
+        if len(new_entities) != new_capacity {
+            println("failed to allocate entity storage");
+            mutex_unlock(&s^.state_mutex);
+            return;
+        }
+
+        // Copy the incoming state before replacing the old storage.
+        i := 0;
+        while i < count {
+            new_entities[i] = incoming[i];
+            i += 1;
+        }
+
+        del_slice(s^.entities, heap_allocator());
+        s^.entities = new_entities;
+        s^.entity_capacity = new_capacity;
+    } else {
+        i := 0;
+        while i < count {
+            s^.entities[i] = incoming[i];
+            i += 1;
+        }
+    }
+
+    s^.entity_count = count;
+    mutex_unlock(&s^.state_mutex);
+}
+fn receiver_loop(s: ^State) {
+    // idk bruh guess
+    buffer := [1024*4]byte{};
+    frame_arena := arena_make(1024*16);
+    msg: Message={0, {nufin=0}}; 
+    while s^.on {
+        n := tcp_recv(s^.server_conn, buffer[:]);
+        if n <= 0 {
+            if n == -1 {
+                println("no data");
+                continue;
+            }
+            println("Received 0 from server.");
+            s^.on = false;
+            return;
+        }
+        b := buffer_wrap(buffer[:n]);
+        if !unpack_message(&b, &msg, arena_allocator(&frame_arena)) {
+            println("failed to unpack message?");
+            continue;
+        }
+        if msg.kind == MK_STATE {
+            replace_entities(s, msg.data.state.entities);
+        }
+
+        arena_reset(&frame_arena);
+    }
+    arena_destroy(&frame_arena);
+    println("end receiver loop");
+}
 fn main() {
+    server_conn := tcp_connect("127.0.0.1", 1234);
+    if server_conn.fd < 0 {
+        println("Failed to init server connection");
+        return;
+    }
+
+    result := tcp_set_recv_timeout(server_conn, 3, 0);
+    if result < 0 {
+        println("failed to set receive timeout");
+        return;
+    }
     init_arena := arena_make(1024*1024); // 1MB
     allocator := arena_allocator(&init_arena);
     s := new::<State>(allocator);
-    s^.entities = make_slice::<Entity>(10, allocator)[:];
+    s^.entities = make_slice::<Entity>(0, heap_allocator());
+    s^.entity_count = 0;
+    s^.entity_capacity = 0;
+    s^.server_conn = server_conn;
+    s^.on = true;
     mutex_init(&s^.state_mutex);
 
     InitWindow(800, 500, clone_cstring("Hello, Raylib!", allocator));
     SetTargetFPS(60);
+    rs := thread_spawn(receiver_loop, s);
 
     model_path := "./duck.obj";
     model := LoadModel(clone_cstring(model_path, allocator));
@@ -45,7 +143,10 @@ fn main() {
             sinf(35*PI/180),
             -sinf(45*PI/180) * cosf(35*PI/180),
     };
-    while !WindowShouldClose() {
+    sendb := [1024]byte{};
+    bf := buffer_wrap(sendb[:]);
+    buffer_clear(&bf);
+    while !WindowShouldClose() && s^.on {
         v = { 0, 0 };
         if IsKeyDown(KEY_UP) {
             v.y += 1;
@@ -89,12 +190,29 @@ fn main() {
         ClearBackground({0,0,0,255});
         BeginMode3D(camera);
         DrawGrid(20, 1.0);
-        DrawModel(model, {-p.x, 0, p.y}, 1.5, {255, 255, 255, 255});
+        i := 0;
+        DrawModel(model, {-p.x, 0, p.y}, 1.5, {255, 0, 0, 80});
+        while i < s^.entity_count {
+            e := s^.entities[i];
+            model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* e.d));
+            DrawModel(model, {-e.pos.x, 0, e.pos.y}, 1.5, {255, 255, 255, 255});
+            i += 1;
+        }
         EndMode3D();
         DrawFPS(10, 10);
         EndDrawing();
+        pack_message({MK_UPDATE, { update = {{p.x, p.y}, {0, 0} , d} } }, &bf);
+        tcp_send(s^.server_conn, buffer_slice(&bf));
+        buffer_clear(&bf);
     }
-    CloseWindow();
+    s^.on = false;
+    thread_join(rs);
+    mutex_destroy(&s^.state_mutex);
+    del_slice(s^.entities, heap_allocator());
+    tcp_shutdown(server_conn, SHUT_RDWR);
+    tcp_close(server_conn);
     mutex_destroy(&s^.state_mutex);
     arena_destroy(&init_arena);
+    UnloadModel(model);
+    CloseWindow();
 }

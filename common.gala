@@ -3,13 +3,27 @@ import "core/mem.gala";
 import "core/buffer_io.gala";
 import "core/core.gala";
 
+// ============================================================
+// Constants
+// ============================================================
+
+MK_CONNECT  :: 1 << 0;
+MK_STATE    :: 1 << 1;
+MK_UPDATE   :: 1 << 2;
+
+MAX_ENTITIES :: 4096;
+
+// ============================================================
+// Types
+// ============================================================
+
 struct Entity {
+    active: bool,
     id: int,
     pos, dir: Vector2,
+    d: f32,
 }
-MK_CONNECT  :: 1<<0;
-MK_STATE    :: 1<<1;
-MK_UPDATE   :: 1<<2;
+
 struct Message {
     kind: int,
     data: union {
@@ -21,38 +35,172 @@ struct Message {
         },
         update: struct {
             pos, dir: Vector2,
+            d: f32,
         },
+        nufin: int,
     }
 }
 
+// ============================================================
+// Entity serialization
+// ============================================================
+
 fn pack_entities(entities: []Entity, buffer: ^Buffer): bool {
     b := buffer;
-    if !buffer_write(b, cast(i64)len(entities)) { return false; }
+    l := cast(i64)len(entities);
+
+    if l < 0 || l > MAX_ENTITIES {
+        return false;
+    }
+
+    if !buffer_write(b, l) {
+        return false;
+    }
+
     for e in entities {
-        if !buffer_write(b, e.id) { return false; }
+        if !buffer_write(b, e.id)    { return false; }
         if !buffer_write(b, e.pos.x) { return false; }
         if !buffer_write(b, e.pos.y) { return false; }
         if !buffer_write(b, e.dir.x) { return false; }
         if !buffer_write(b, e.dir.y) { return false; }
+        if !buffer_write(b, e.d) { return false; }
     }
+
     return true;
 }
 
-fn unpack_entities(b: ^Buffer, entities: ^[]Entity, allocator := base_allocator): bool {
-    l: i64 = -1;
-    if !buffer_read(b, &l) { return false; }
+fn unpack_entities(
+    b: ^Buffer,
+    entities: ^[]Entity,
+    allocator := base_allocator
+): bool {
+    l: i64 = 0;
+
+    if !buffer_read(b, &l) {
+        return false;
+    }
+
+    if l < 0 || l > MAX_ENTITIES {
+        return false;
+    }
+
     data := make_slice::<Entity>(l, allocator);
-    i := 0;
+
+    i: i64 = 0;
     while i < l {
-        e := Entity{ 0, { 0, 0 }, { 0, 0 } };
-        if !buffer_read(b, &e.id)  { return false; }
-        if !buffer_read(b, &e.pos.x)  { return false; }
-        if !buffer_read(b, &e.pos.y)  { return false; }
-        if !buffer_read(b, &e.dir.x)  { return false; }
-        if !buffer_read(b, &e.dir.y)  { return false; }
+        e := Entity{false, 0, { 0, 0 }, { 0, 0 }, 0 };
+
+        if !buffer_read(b, &e.id)    { return false; }
+        if !buffer_read(b, &e.pos.x) { return false; }
+        if !buffer_read(b, &e.pos.y) { return false; }
+        if !buffer_read(b, &e.dir.x) { return false; }
+        if !buffer_read(b, &e.dir.y) { return false; }
+        if !buffer_read(b, &e.d) { return false; }
+
         data[i] = e;
         i += 1;
     }
+
     entities^ = data;
     return true;
 }
+
+// ============================================================
+// Message serialization
+// ============================================================
+
+fn pack_message(message: Message, buffer: ^Buffer): bool {
+    b := buffer;
+
+    if !buffer_write(b, message.kind) {
+        return false;
+    }
+
+    if message.kind == MK_CONNECT {
+        if !buffer_write(b, message.data.connect.id) {
+            return false;
+        }
+
+    } else if message.kind == MK_STATE {
+        if !pack_entities(message.data.state.entities, b) {
+            return false;
+        }
+
+    } else if message.kind == MK_UPDATE {
+        if !buffer_write(b, message.data.update.pos.x) {
+            return false;
+        }
+        if !buffer_write(b, message.data.update.pos.y) {
+            return false;
+        }
+        if !buffer_write(b, message.data.update.dir.x) {
+            return false;
+        }
+        if !buffer_write(b, message.data.update.dir.y) {
+            return false;
+        }
+        if !buffer_write(b, message.data.update.d) {
+            return false;
+        }
+
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
+fn unpack_message(
+    b: ^Buffer,
+    message: ^Message,
+    allocator := base_allocator
+): bool {
+    kind: int = 0;
+
+    if !buffer_read(b, &kind) {
+        return false;
+    }
+
+    if kind == MK_CONNECT {
+        id: int = 0;
+
+        if !buffer_read(b, &id) {
+            return false;
+        }
+
+        message^.kind = MK_CONNECT;
+        message^.data.connect.id = id;
+
+    } else if kind == MK_STATE {
+        entities: []Entity = ([0]Entity{})[:];
+
+        if !unpack_entities(b, &entities, allocator) {
+            return false;
+        }
+
+        message^.kind = MK_STATE;
+        message^.data.state.entities = entities;
+
+    } else if kind == MK_UPDATE {
+        pos := Vector2{ 0, 0 };
+        dir := Vector2{ 0, 0 };
+        d: f32 = 0;
+
+        if !buffer_read(b, &pos.x) { return false; }
+        if !buffer_read(b, &pos.y) { return false; }
+        if !buffer_read(b, &dir.x) { return false; }
+        if !buffer_read(b, &dir.y) { return false; }
+        if !buffer_read(b, &d) { return false; }
+
+        message^.kind = MK_UPDATE;
+        message^.data.update.pos = pos;
+        message^.data.update.dir = dir;
+        message^.data.update.d = d;
+
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
