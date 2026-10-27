@@ -1,9 +1,9 @@
 all:
 	galac main.gala -o prog
-	./prog
+	LD_LIBRARY_PATH=./ ./prog
 d:
 	galac main.gala -o prog -d
-	./prog
+	LD_LIBRARY_PATH=./ ./prog
 client: client.gala
 	galac client.gala -o client
 cclient: client.gala

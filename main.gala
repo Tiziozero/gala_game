@@ -6,13 +6,16 @@ import "core/mem.gala";
 import "./common.gala";
 
 struct Client {
-    actieve: bool,
+    active: bool,
+    id: int,
     socket: TcpSocket,
-    entity: Entity,
+    entity_id: int,
 }
 struct State {
-    state_mutex: Mutex,
-    clients: [1024]Client,
+    state_mutex:    Mutex,
+    clients:        [1024]Client,
+    ccount:         int,
+    entities:       [1024]Entity,
 }
 
 struct hc_payload { clients_socket: TcpSocket, s: ^State }
@@ -26,9 +29,34 @@ fn handle_client(payload: ^hc_payload) {
 
     free(cast(rawptr)payload);
     println("closed fd:", client_socket.fd);
-    kill_client(Client{ false, client_socket});
 }
 
+fn insert_client(s: ^State, c: Client, e: Entity): struct { r: bool, id: int}  {
+    if s^.ccount >= len(s^.clients) {
+        return {false, 0};
+    }
+    i := 0;
+    for v in s^.clients {
+        if v.active { i += 1; continue; }
+        nc := c;
+        nc.entity_id = i; // entity id. not really needed cus should be the same. or nah not really. yeah
+        s^.clients[i] = nc;
+        s^.entities[i] = e;
+        return {true, i};
+    }
+    return {false, 0};
+}
+
+fn remove_client(s: ^State, c: Client): struct { r: bool, id: int} {
+    i := 0; for v in s^.clients {
+        if v.id == c.id {
+            s^.clients[i].active = false;
+            return {true, i};
+        }
+        i += 1;
+    }
+    return {false, 0};
+}
 fn kill_client(c: Client) {
     tcp_shutdown(c.socket, SHUT_RDWR);
     tcp_close(c.socket);
