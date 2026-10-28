@@ -9,10 +9,16 @@ import "core/string_builder.gala";
 import "./common.gala";
 
 
-I := Matrix { [16]f32{1, 0, 0, 0,
-0, 1, 0, 0,
-0, 0, 1, 0,
-0, 0, 0, 1,} };
+// draw space inverts x axis. that only.
+
+
+I := Matrix { [16]f32{
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    0, 0, 0, 1,
+    }
+};
 
 struct State {
     state_mutex:    Mutex,
@@ -92,6 +98,10 @@ fn receiver_loop(s: ^State) {
         b := buffer_wrap(buffer[:n]);
         if !unpack_message(&b, &msg, arena_allocator(&frame_arena)) {
             println("failed to unpack message?");
+            v := 0;
+            for i in buffer[:n] {
+                println(v, i);
+            }
             continue;
         }
         if msg.kind == MK_STATE {
@@ -113,6 +123,24 @@ fn slog(s: ^State, data: ..any) {
             10, 40 + 20*s^.log_index, 20, {255, 255, 255, 255});
     s^.log_index += 1;
     sb_reset(&s^.log_builder);
+}
+fn mouse_to_ground(camera: Camera3D): Vector2 {
+    ray := GetScreenToWorldRay(GetMousePosition(), camera);
+
+    if ray.direction.y > -0.0001 && ray.direction.y < 0.0001 {
+        return {0, 0};
+    }
+
+    t := -ray.position.y / ray.direction.y;
+    if t < 0 {
+        return {0, 0};
+    }
+
+    hx := ray.position.x + t * ray.direction.x;
+    hz := ray.position.z + t * ray.direction.z;
+
+    // you draw things at {-x, 0, y}, so undo that mapping
+    return { -hx, hz };
 }
 fn main() {
     server_conn := tcp_connect("127.0.0.1", 1234);
@@ -136,6 +164,11 @@ fn main() {
     s^.on = true;
     mutex_init(&s^.state_mutex);
 
+    initmsgrecv:=[1024]byte{};
+    initn := tcp_recv(s^.server_conn, initmsgrecv[:]);
+    initb := buffer_wrap(initmsgrecv[:initn]);
+    id := -1;
+    buffer_read(&initb, &id);
     InitWindow(800, 500, clone_cstring("Hello, Raylib!", allocator));
     SetTargetFPS(60);
     rs := thread_spawn(receiver_loop, s);
@@ -151,7 +184,6 @@ fn main() {
     };
 
     v := Vector2 { 0, 0 };
-    p := Vector2 { 0, 0 };
     last_d := v;
 
     camabc := Vector3 {
@@ -165,80 +197,71 @@ fn main() {
     s^.frame_arena  = arena_make(1024*1024); // 1MB
     s^.log_arena    = arena_make(1024*1024); // 1MB
 
-
     // Releases the builder's storage logically through the arena,
     // then releases the arena's entire backing allocation.
     // sb_free(&sb);
 
     zoom: f32 = 5;
+    self := empty_entity();
     while !WindowShouldClose() && s^.on {
+        for e in s^.entities {
+            if e.id == id { self = e; }
+        }
         s^.log_builder = sb_make(arena_allocator(&s^.log_arena));
-        slog(s, "Hello", "World");
-        slog(s, p);
+        slog(s, id);
+        slog(s, self.pos);
         v = { 0, 0 };
         mw := GetMouseWheelMove();
         if mw > 0 { zoom += 0.1; }
         if mw < 0 { zoom -= 0.1; }
         if zoom < 2 { zoom = 2; }
         if zoom > 10 { zoom = 10; }
-        if IsKeyDown(KEY_UP) {
-            v.y += 1;
-        }
-        if IsKeyDown(KEY_DOWN) {
-            v.y -= 1;
-        }
-        if IsKeyDown(KEY_LEFT) {
-            v.x -= 1;
-        }
-        if IsKeyDown(KEY_RIGHT) {
-            v.x += 1;
-        }
-        if v.x != 0 || v.y != 0 {
-            v = Vector2Normalize(v);
-        }
-        v = Vector2Rotate(v, -PI/4);
-        dt := GetFrameTime();
-        p.x += dt*2*v.x;
-        p.y += dt*2*v.y;
-        if v.x != 0 || v.y != 0 {
-            last_d = v;
-        }
-        
-        d := -atan2f(last_d.x, last_d.y) / (PI / 2);
-        d = roundf(d * 2) / 2;
-
-        if d < 0 {
-            d += 4;
-        }
-        model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* d));
         // target and some bullshit going on here.
-        camera.position.x = zoom*camabc.x + -p.x;
+        camera.position.x = zoom*camabc.x + -self.pos.x;
         camera.position.y = zoom*camabc.y;
-        camera.position.z = zoom*camabc.z + p.y;
-        camera.target.x = -p.x;
-        camera.target.y = 0;
-        camera.target.z =  p.y;
+        camera.position.z = zoom*camabc.z + self.pos.y;
+        camera.target.x = -self.pos.x;
+        camera.target.y = 0.5;
+        camera.target.z =  self.pos.y;
 
         BeginDrawing();
         ClearBackground({0,0,0,255});
         BeginMode3D(camera);
         DrawGrid(20, 1.0);
         i := 0;
-        DrawModel(model, {-p.x, 0, p.y}, 1.5, {255, 0, 0, 80});
+        DrawModel(model, {-self.pos.x, 0, self.pos.y}, 1.5, {255, 0, 0, 80});
         while i < s^.entity_count {
             e := s^.entities[i];
             model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* e.d));
             DrawPoint3D({-e.pos.x, 0, e.pos.y}, {255,0,0,255});
             DrawModel(model, {-e.pos.x, 0, e.pos.y}, 1.5, {255, 255, 255, 255});
             DrawPoint3D({-e.pos.x, 0, e.pos.y}, {255,0,0,255});
+            DrawCircle3D({-e.pos.x, 0, e.pos.y}, 0.15, {1, 0, 0}, 90, {255,0,0,255});
+            DrawBoundingBox({{-e.pos.x -0.5, 0, e.pos.y -0.5},{-e.pos.x +0.5, 1, e.pos.y +0.5}}, {0, 0, 255, 255});
+            slog(s, e.pos.x, e.pos.y);
+
             i += 1;
+        }
+        if IsMouseButtonDown(MOUSE_BUTTON_LEFT) {
+            target := mouse_to_ground(camera);
+            DrawPoint3D({-target.x, 0, target.y}, {255,0,0,255});
+            slog(s, target);
+        }
+        if IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) {
+            target := mouse_to_ground(camera);
+            DrawPoint3D({-target.x, 0, target.y}, {255,0,0,255});
+            println(target);
+            buffer_clear(&bf);
+            pack_message({MK_UPDATE, { update = { UPDATE_MOVE_TO, { move_to = target } }  } }, &bf);
+            tcp_send(s^.server_conn, buffer_slice(&bf));
+            buffer_clear(&bf);
         }
         EndMode3D();
         DrawFPS(10, 10);
         EndDrawing();
-        pack_message({MK_UPDATE, { update = {{p.x, p.y}, {0, 0} , d} } }, &bf);
-        tcp_send(s^.server_conn, buffer_slice(&bf));
-        buffer_clear(&bf);
+        // pack_message({MK_UPDATE, { update = {{p.x, p.y}, {0, 0} , d} } }, &bf);
+        // tcp_send(s^.server_conn, buffer_slice(&bf));
+        // buffer_clear(&bf);
         arena_reset(&s^.frame_arena);
         arena_reset(&s^.log_arena);
         s^.log_index = 0;

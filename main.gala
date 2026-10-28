@@ -12,15 +12,18 @@ struct Client {
     id: int,
     socket: TcpSocket,
     entity_id: int,
+    move_to: Vector2,
 }
 struct State {
     state_mutex:    Mutex,
-    clients:        [1024]Client,
+    clients:        [MAX_ENTITIES]Client,
     ccount:         int,
-    entities:       [1024]Entity,
+    entities:       [MAX_ENTITIES]Entity,
+    edata:          [MAX_ENTITIES]struct { lock: Mutex },
     on:             bool,
 }
 
+global_i := 0;
 struct hc_payload { clients_socket: TcpSocket, s: ^State }
 fn handle_client(payload: ^hc_payload) {
     client_socket := payload^.clients_socket;
@@ -28,16 +31,22 @@ fn handle_client(payload: ^hc_payload) {
 
     println("fd:", client_socket.fd);
 
-    b := buffer_make(64);
-    buffer_write_string(&b, "Hello");
-    // no pipe
-    tcp_send(client_socket, buffer_slice(&b), flags=0x4000);
-    
-    buffer_destroy(&b);
-    c := Client{true, -1, client_socket, -1};
+
+    c := Client{true, -1, client_socket, -1, {0,0}};
     e := Entity{true, -1, {0,0}, {0,0}, 0};
     nc := insert_client(s, c, e);
 
+    if !nc.r {
+        println("Failed to insert client?");
+        return;
+    }
+    
+    // send entity id
+    b := buffer_make(64);
+    buffer_write(&b, s^.clients[nc.id].entity_id);
+    // no pipe
+    tcp_send(client_socket, buffer_slice(&b), flags=0x4000);
+    buffer_destroy(&b);
 
     c = s^.clients[nc.id];
     rb := [1024]byte{};
@@ -46,24 +55,35 @@ fn handle_client(payload: ^hc_payload) {
         n := tcp_recv(c.socket, rb[:]);
         if n <= 0 {
             println("revceived {} bytes from client. killing.", n);
-            remove_client(s, c.id);
             break;
         }
         bf := buffer_wrap(rb[:n]);
         m := Message{0, { nufin = 0 }};
         if !unpack_message(&bf,&m, arena_allocator(&frame_arena)) {
+            v := 0;
+            for i in rb[:n] {
+                println(v, i);
+            }
             println("failed to unpack message");
-            remove_client(s, c.id);
             break;
         }
         if m.kind == MK_UPDATE {
-            mutex_lock(&s^.state_mutex);
-            s^.entities[c.entity_id].pos = m.data.update.pos;
-            s^.entities[c.entity_id].dir = m.data.update.dir;
-            s^.entities[c.entity_id].d = m.data.update.d;
-            mutex_unlock(&s^.state_mutex);
+            uk := m.data.update.kind;
+            if uk == UPDATE_MOVE_TO {
+                p := m.data.update.data.move_to;
+                mutex_lock(&s^.state_mutex);
+                // s^.entities[c.entity_id].pos = m.data.update.pos;
+                // s^.entities[c.entity_id].dir = m.data.update.dir;
+                // s^.entities[c.entity_id].d = m.data.update.d;
+                s^.clients[c.id].move_to = p;
+                mutex_unlock(&s^.state_mutex);
+            } else {
+                println("Invalid update message kind form user: {} (got {}).", c.id, uk);
+                break;
+            }
         }
     }
+    remove_client(s, c.id);
     arena_destroy(&frame_arena);
     free(cast(rawptr)payload);
 }
@@ -90,6 +110,7 @@ fn insert_entity(s: ^State, e: Entity): struct { r: bool, id: int } {
         ne.id = i;
         ne.active = true;
         s^.entities[i] = ne;
+        mutex_init(&s^.edata[i].lock);
 
         return {true, i};
     }
@@ -107,6 +128,7 @@ fn delete_entity(s: ^State, id: int): bool {
     }
 
     s^.entities[id].active = false;
+    mutex_destroy(&s^.edata[id].lock);
     return true;
 }
 
@@ -168,21 +190,52 @@ fn kill_client(s: ^State, c: Client) {
 }
 
 
+fn update_state(s: ^State, dt: f32 = 0.01 /* for now ig */) {
+    for c in s^.clients {
+        if !c.active  { continue; }
+        mutex_lock(&s^.edata[c.entity_id].lock);
+            e := s^.entities[c.entity_id];
+            dv := Vector2{
+                c.move_to.x - e.pos.x,
+                c.move_to.y - e.pos.y,
+            };
+            if Vector2Length(dv) > 0.01 {
+                d := Vector2Normalize(dv);
+                d.x *= dt*1.2;
+                d.y *= dt*1.2;
+                e.pos = Vector2Add(e.pos, d);
+                nd := -atan2f(dv.x, dv.y) / (PI / 2);
+
+                if nd < 0 {
+                    nd += 4;
+                }
+                e.d = nd;
+            }
+                    
+            s^.entities[c.entity_id] = e;
+        mutex_unlock(&s^.edata[c.entity_id].lock);
+    }
+}
 fn sender_thread(s: ^State) {
     entities := [1024]Entity{};
     b := buffer_make(1024);
     while s^.on {
         sleep_ms(10);
+        update_state(s);
         if s^.ccount <= 0 {
-            continue;
+            continue; // no clients to send to
         }
         mutex_lock(&s^.state_mutex);
         l := 0;
+        i := 0;
         for e in s^.entities {
             if e.active {
+                mutex_lock(&s^.edata[i].lock);
                 entities[l] = e;
+                mutex_unlock(&s^.edata[i].lock);
                 l += 1;
             }
+            i += 1;
         }
         mutex_unlock(&s^.state_mutex);
         msg := Message { MK_STATE, { state = { entities[:l] } } };
