@@ -5,6 +5,7 @@ import "core/mem.gala";
 import "core/cfunctions.gala";
 import "core/threads.gala";
 import "core/buffer_io.gala";
+import "core/string_builder.gala";
 import "./common.gala";
 
 
@@ -18,6 +19,10 @@ struct State {
     server_conn:    TcpSocket,
     entities:       []Entity,
     entity_capacity, entity_count: i64,
+    frame_arena:      Arena,
+    log_arena:      Arena,
+    log_builder:    StringBuilder,
+    log_index:      i32,
     on:             bool,
 }
 
@@ -98,6 +103,17 @@ fn receiver_loop(s: ^State) {
     arena_destroy(&frame_arena);
     println("end receiver loop");
 }
+
+fn slog(s: ^State, data: ..any) {
+    a := arena_allocator(&s^.log_arena);
+    for i in data {
+        sb_print(&s^.log_builder, i, " ");
+    }
+    DrawText(clone_cstring(sb_string(&s^.log_builder), a),
+            10, 40 + 20*s^.log_index, 20, {255, 255, 255, 255});
+    s^.log_index += 1;
+    sb_reset(&s^.log_builder);
+}
 fn main() {
     server_conn := tcp_connect("127.0.0.1", 1234);
     if server_conn.fd < 0 {
@@ -146,8 +162,25 @@ fn main() {
     sendb := [1024]byte{};
     bf := buffer_wrap(sendb[:]);
     buffer_clear(&bf);
+    s^.frame_arena  = arena_make(1024*1024); // 1MB
+    s^.log_arena    = arena_make(1024*1024); // 1MB
+
+
+    // Releases the builder's storage logically through the arena,
+    // then releases the arena's entire backing allocation.
+    // sb_free(&sb);
+
+    zoom: f32 = 5;
     while !WindowShouldClose() && s^.on {
+        s^.log_builder = sb_make(arena_allocator(&s^.log_arena));
+        slog(s, "Hello", "World");
+        slog(s, p);
         v = { 0, 0 };
+        mw := GetMouseWheelMove();
+        if mw > 0 { zoom += 0.1; }
+        if mw < 0 { zoom -= 0.1; }
+        if zoom < 2 { zoom = 2; }
+        if zoom > 10 { zoom = 10; }
         if IsKeyDown(KEY_UP) {
             v.y += 1;
         }
@@ -179,9 +212,9 @@ fn main() {
         }
         model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* d));
         // target and some bullshit going on here.
-        camera.position.x = 5*camabc.x + -p.x;
-        camera.position.y = 5*camabc.y;
-        camera.position.z = 5*camabc.z + p.y;
+        camera.position.x = zoom*camabc.x + -p.x;
+        camera.position.y = zoom*camabc.y;
+        camera.position.z = zoom*camabc.z + p.y;
         camera.target.x = -p.x;
         camera.target.y = 0;
         camera.target.z =  p.y;
@@ -195,7 +228,9 @@ fn main() {
         while i < s^.entity_count {
             e := s^.entities[i];
             model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* e.d));
+            DrawPoint3D({-e.pos.x, 0, e.pos.y}, {255,0,0,255});
             DrawModel(model, {-e.pos.x, 0, e.pos.y}, 1.5, {255, 255, 255, 255});
+            DrawPoint3D({-e.pos.x, 0, e.pos.y}, {255,0,0,255});
             i += 1;
         }
         EndMode3D();
@@ -204,6 +239,9 @@ fn main() {
         pack_message({MK_UPDATE, { update = {{p.x, p.y}, {0, 0} , d} } }, &bf);
         tcp_send(s^.server_conn, buffer_slice(&bf));
         buffer_clear(&bf);
+        arena_reset(&s^.frame_arena);
+        arena_reset(&s^.log_arena);
+        s^.log_index = 0;
     }
     s^.on = false;
     thread_join(rs);
@@ -212,6 +250,8 @@ fn main() {
     tcp_shutdown(server_conn, SHUT_RDWR);
     tcp_close(server_conn);
     mutex_destroy(&s^.state_mutex);
+    arena_destroy(&s^.frame_arena);
+    arena_destroy(&s^.log_arena);
     arena_destroy(&init_arena);
     UnloadModel(model);
     CloseWindow();

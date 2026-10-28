@@ -1,4 +1,5 @@
 import "core/core.gala";
+import "core/rl.gala";
 import "core/net.gala";
 import "core/cfunctions.gala";
 import "core/threads.gala";
@@ -45,14 +46,14 @@ fn handle_client(payload: ^hc_payload) {
         n := tcp_recv(c.socket, rb[:]);
         if n <= 0 {
             println("revceived {} bytes from client. killing.", n);
-            remove_client(s, c);
+            remove_client(s, c.id);
             break;
         }
         bf := buffer_wrap(rb[:n]);
         m := Message{0, { nufin = 0 }};
         if !unpack_message(&bf,&m, arena_allocator(&frame_arena)) {
             println("failed to unpack message");
-            remove_client(s, c);
+            remove_client(s, c.id);
             break;
         }
         if m.kind == MK_UPDATE {
@@ -77,41 +78,90 @@ fn find_client(s: ^State, id: int): struct { r: bool, id: int } {
     }
     return {false, -1};
 }
-fn insert_client(s: ^State, c: Client, e: Entity): struct { r: bool, id: int}  {
-    if s^.ccount >= len(s^.clients) {
-        return {false, 0};
-    }
+fn insert_entity(s: ^State, e: Entity): struct { r: bool, id: int } {
     i := 0;
-    for v in s^.clients {
-        if v.active { i += 1; continue; }
-        nc := c;
-        nc.entity_id = i; // entity id. not really needed cus should be the same. or nah not really. yeah
+    for v in s^.entities {
+        if v.active {
+            i += 1;
+            continue;
+        }
+
         ne := e;
         ne.id = i;
-
-        s^.clients[i] = nc;
+        ne.active = true;
         s^.entities[i] = ne;
-        s^.ccount += 1;
+
         return {true, i};
     }
-    return {false, 0};
+
+    return {false, -1};
 }
 
-fn remove_client(s: ^State, c: Client): struct { r: bool, id: int} {
-    if s^.ccount <= 0 { return {false, -1}; }
-    i := 0; for v in s^.clients {
-        if v.id == c.id {
-            s^.clients[i].active = false;
-            s^.entities[c.entity_id].active = false;
-            s^.ccount -= 1;
-            return {true, i};
-        }
-        i += 1;
+fn delete_entity(s: ^State, id: int): bool {
+    if id < 0 || id >= len(s^.entities) {
+        return false;
     }
-    return {false, 0};
+
+    if !s^.entities[id].active {
+        return false;
+    }
+
+    s^.entities[id].active = false;
+    return true;
+}
+
+fn insert_client(s: ^State, c: Client, e: Entity): struct { r: bool, id: int } {
+    if s^.ccount >= len(s^.clients) {
+        return {false, -1};
+    }
+
+    // Find an available client slot first.
+    i := 0;
+    for v in s^.clients {
+        if v.active {
+            i += 1;
+            continue;
+        }
+
+        // Allocate the entity independently of the client slot.
+        er := insert_entity(s, e);
+        if !er.r {
+            return {false, -1};
+        }
+
+        nc := c;
+        nc.id = i;
+        nc.entity_id = er.id;
+        nc.active = true;
+
+        s^.clients[i] = nc;
+        s^.ccount += 1;
+
+        return {true, i};
+    }
+
+    return {false, -1};
+}
+
+fn remove_client(s: ^State, id: int): bool {
+    if id < 0 || id >= len(s^.clients) {
+        return false;
+    }
+
+    if !s^.clients[id].active {
+        return false;
+    }
+
+    entity_id := s^.clients[id].entity_id;
+
+    s^.clients[id].active = false;
+    s^.ccount -= 1;
+
+    delete_entity(s, entity_id);
+    return true;
 }
 fn kill_client(s: ^State, c: Client) {
-    remove_client(s, c);
+    remove_client(s, c.id);
     tcp_shutdown(c.socket, SHUT_RDWR);
     tcp_close(c.socket);
     println("closed client:", c.id, c.socket.fd);
@@ -154,13 +204,20 @@ fn sender_thread(s: ^State) {
     }
 }
 
-fn main() {
+fn main(): i32 {
     listener := tcp_listen(1234, 10);
+    if listener.fd < 0 {
+        println("Failed to initialise listener.");
+        return -1;
+    }
     s := new::<State>();
 
     st := thread_spawn(sender_thread, s);
 
     s^.on = true;
+
+    insert_entity(s, {true, -1, {20, 20}, {0, 0}, PI/2*3});
+    insert_entity(s, {true, -1, {40, 20}, {0, 0}, PI/2*3});
     while s^.on  {
         println("Accepting connection.");
         c := tcp_accept(listener);
@@ -179,4 +236,5 @@ fn main() {
     free(cast(rawptr)s);
     println("Closing listener.");
     tcp_close(listener);
+    return 0;
 }
