@@ -122,7 +122,7 @@ fn slog(s: ^State, data: ..any) {
     DrawText(clone_cstring(sb_string(&s^.log_builder), a),
             10, 40 + 20*s^.log_index, 20, {255, 255, 255, 255});
     s^.log_index += 1;
-    sb_reset(&s^.log_builder);
+    sb_clear(&s^.log_builder);
 }
 fn mouse_to_ground(camera: Camera3D): Vector2 {
     ray := GetScreenToWorldRay(GetMousePosition(), camera);
@@ -142,6 +142,8 @@ fn mouse_to_ground(camera: Camera3D): Vector2 {
     // you draw things at {-x, 0, y}, so undo that mapping
     return { -hx, hz };
 }
+SCREEN_WIDTH :: 800;
+SCREEN_HEIGHT :: 500;
 fn main() {
     server_conn := tcp_connect("127.0.0.1", 1234);
     if server_conn.fd < 0 {
@@ -169,7 +171,7 @@ fn main() {
     initb := buffer_wrap(initmsgrecv[:initn]);
     id := -1;
     buffer_read(&initb, &id);
-    InitWindow(800, 500, clone_cstring("Hello, Raylib!", allocator));
+    InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, clone_cstring("Hello, Raylib!", allocator));
     SetTargetFPS(60);
     rs := thread_spawn(receiver_loop, s);
 
@@ -204,12 +206,15 @@ fn main() {
     zoom: f32 = 5;
     self := empty_entity();
     while !WindowShouldClose() && s^.on {
-        for e in s^.entities {
-            if e.id == id { self = e; }
+        i := 0;
+        while i < s^.entity_count {
+            e := s^.entities[i];
+            if e.id == id { self = e; break; }
+            i+=1;
         }
         s^.log_builder = sb_make(arena_allocator(&s^.log_arena));
         slog(s, id);
-        slog(s, self.pos);
+        slog(s, self.pos.x, self.pos.y);
         v = { 0, 0 };
         mw := GetMouseWheelMove();
         if mw > 0 { zoom += 0.1; }
@@ -228,35 +233,42 @@ fn main() {
         ClearBackground({0,0,0,255});
         BeginMode3D(camera);
         DrawGrid(20, 1.0);
-        i := 0;
-        DrawModel(model, {-self.pos.x, 0, self.pos.y}, 1.5, {255, 0, 0, 80});
+        // only first "entity_count" entities are relevant
+        i = 0;
         while i < s^.entity_count {
             e := s^.entities[i];
             model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* e.d));
-            DrawPoint3D({-e.pos.x, 0, e.pos.y}, {255,0,0,255});
             DrawModel(model, {-e.pos.x, 0, e.pos.y}, 1.5, {255, 255, 255, 255});
-            DrawPoint3D({-e.pos.x, 0, e.pos.y}, {255,0,0,255});
             DrawCircle3D({-e.pos.x, 0, e.pos.y}, 0.15, {1, 0, 0}, 90, {255,0,0,255});
             DrawBoundingBox({{-e.pos.x -0.5, 0, e.pos.y -0.5},{-e.pos.x +0.5, 1, e.pos.y +0.5}}, {0, 0, 255, 255});
-            slog(s, e.pos.x, e.pos.y);
-
             i += 1;
+        }
+        EndMode3D();
+        // dialouges
+        i = 0;
+        a := arena_allocator(&s^.frame_arena);
+        while i < s^.entity_count {
+            e := s^.entities[i];
+            if e.id == self.id {  i += 1; continue; }
+            if Vector2Length(Vector2Subtract(self.pos, e.pos)) < 1 {
+                slog(s, "Talk to", e.id);
+                DrawRectangleRounded({SCREEN_WIDTH/2 + 80, SCREEN_HEIGHT/2, 200, 40 }, 1, 0, {0,0,0,175});
+                DrawRectangleRoundedLines({SCREEN_WIDTH/2 + 80, SCREEN_HEIGHT/2, 200, 40 }, 1, 0, {255, 255, 255, 255});
+                str := clone_cstring(tprint(a, "Talk to", e.id), a);
+                DrawText(str, SCREEN_WIDTH/2 + 80 + 20, SCREEN_HEIGHT/2  + 10, 20, {255, 255, 255, 255});
+            }
+            i+=1;
         }
         if IsMouseButtonDown(MOUSE_BUTTON_LEFT) {
             target := mouse_to_ground(camera);
-            DrawPoint3D({-target.x, 0, target.y}, {255,0,0,255});
-            slog(s, target);
         }
         if IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) {
             target := mouse_to_ground(camera);
-            DrawPoint3D({-target.x, 0, target.y}, {255,0,0,255});
-            println(target);
             buffer_clear(&bf);
             pack_message({MK_UPDATE, { update = { UPDATE_MOVE_TO, { move_to = target } }  } }, &bf);
             tcp_send(s^.server_conn, buffer_slice(&bf));
             buffer_clear(&bf);
         }
-        EndMode3D();
         DrawFPS(10, 10);
         EndDrawing();
         // pack_message({MK_UPDATE, { update = {{p.x, p.y}, {0, 0} , d} } }, &bf);
