@@ -176,6 +176,10 @@ fn main() {
     rs := thread_spawn(receiver_loop, s);
 
     model_path := "./duck.obj";
+    scale : f32 = 1.5;
+
+    model_path = "assets/B3.glb";
+    scale = 0.4;
     model := LoadModel(clone_cstring(model_path, allocator));
     camera := Camera3D {
         position = { 5.0, 4.0, 5.0 },
@@ -184,6 +188,7 @@ fn main() {
         fovy = 45.0,
         projection = 0, // "CAMERA_PERSPECTIVE" in reaylib header is 0
     };
+    println("loaded", model_path);
 
     v := Vector2 { 0, 0 };
     last_d := v;
@@ -203,6 +208,7 @@ fn main() {
     // then releases the arena's entire backing allocation.
     // sb_free(&sb);
 
+    frame: f32 = 0;
     zoom: f32 = 5;
     self := empty_entity();
     while !WindowShouldClose() && s^.on {
@@ -233,12 +239,14 @@ fn main() {
         ClearBackground({0,0,0,255});
         BeginMode3D(camera);
         DrawGrid(20, 1.0);
+
+
         // only first "entity_count" entities are relevant
         i = 0;
         while i < s^.entity_count {
             e := s^.entities[i];
             model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* e.d));
-            DrawModel(model, {-e.pos.x, 0, e.pos.y}, 1.5, {255, 255, 255, 255});
+            DrawModel(model, {-e.pos.x, 0, e.pos.y}, scale, {255, 255, 255, 255});
             DrawCircle3D({-e.pos.x, 0, e.pos.y}, 0.15, {1, 0, 0}, 90, {255,0,0,255});
             DrawBoundingBox({{-e.pos.x -0.5, 0, e.pos.y -0.5},{-e.pos.x +0.5, 1, e.pos.y +0.5}}, {0, 0, 255, 255});
             i += 1;
