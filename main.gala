@@ -7,86 +7,233 @@ import "core/mem.gala";
 import "core/buffer_io.gala";
 import "./common.gala";
 
+AI_IDLE   :: 0;
+AI_CHASE  :: 1;
+AI_ATTACK :: 2;
+
+struct Brain {
+    move_to: Vector2,
+    moving: bool,
+    home: Vector2,
+    target_id: int,
+    ai_state: int,
+    timer: f32,
+    client_id: int, // -1 unless player
+}
+
 struct Client {
     active: bool,
     id: int,
     socket: TcpSocket,
     entity_id: int,
-    move_to: Vector2,
 }
+
+// state_mutex protects everything in here
 struct State {
     state_mutex:    Mutex,
     clients:        [MAX_ENTITIES]Client,
     ccount:         int,
     entities:       [MAX_ENTITIES]Entity,
-    edata:          [MAX_ENTITIES]struct { lock: Mutex },
+    brains:         [MAX_ENTITIES]Brain,
     on:             bool,
 }
 
-global_i := 0;
-struct hc_payload { clients_socket: TcpSocket, s: ^State }
-fn handle_client(payload: ^hc_payload) {
-    client_socket := payload^.clients_socket;
-    s := payload^.s;
+// ============================================================
+// AI interface. Every fn runs with state_mutex held.
+// ============================================================
 
-    println("fd:", client_socket.fd);
+struct AiFns {
+    think: fn(s: ^State, id: int, dt: f32),
+    interact: fn(s: ^State, id: int, by: int),
+}
 
+rng_state := 12345;
 
-    c := Client{true, -1, client_socket, -1, {0,0}};
-    e := Entity{true, -1, {0,0}, {0,0}, 0};
-    nc := insert_client(s, c, e);
+fn rand_f(): f32 {
+    rng_state = (rng_state * 1103515245 + 12345) % 2147483648;
+    return cast(f32)(rng_state % 10000) / 10000.0;
+}
 
-    if !nc.r {
-        println("Failed to insert client?");
+fn dist(a: Vector2, b: Vector2): f32 {
+    return Vector2Length(Vector2{a.x - b.x, a.y - b.y});
+}
+
+fn find_nearest_player(s: ^State, p: Vector2, radius: f32): int {
+    best := -1;
+    best_d := radius;
+    i := 0;
+    while i < MAX_ENTITIES {
+        if s^.entities[i].active && s^.entities[i].kind == EK_PLAYER {
+            dd := dist(p, s^.entities[i].pos);
+            if dd < best_d {
+                best_d = dd;
+                best = i;
+            }
+        }
+        i += 1;
+    }
+    return best;
+}
+
+fn ai_none_think(s: ^State, id: int, dt: f32) {}
+fn ai_none_interact(s: ^State, id: int, by: int) {}
+
+fn ai_npc_think(s: ^State, id: int, dt: f32) {
+    b := &s^.brains[id];
+    if b^.moving { return; }
+
+    b^.timer -= dt;
+    if b^.timer > 0 { return; }
+
+    b^.timer = 2.0 + rand_f() * 3.0;
+    b^.move_to = Vector2{
+        b^.home.x + (rand_f() - 0.5) * 4.0,
+        b^.home.y + (rand_f() - 0.5) * 4.0
+    };
+    b^.moving = true;
+}
+
+fn ai_npc_interact(s: ^State, id: int, by: int) {
+    println("duck {} was talked to by {}", id, by);
+}
+
+fn ai_hostile_think(s: ^State, id: int, dt: f32) {
+    b := &s^.brains[id];
+    e := &s^.entities[id];
+    ed := get_def(e^.def);
+
+    if b^.ai_state == AI_IDLE {
+        found := find_nearest_player(s, e^.pos, ed.aggro);
+        if found >= 0 {
+            b^.target_id = found;
+            b^.ai_state = AI_CHASE;
+            return;
+        }
+        ai_npc_think(s, id, dt);
         return;
     }
-    
-    // send entity id
-    b := buffer_make(64);
-    buffer_write(&b, s^.clients[nc.id].entity_id);
-    // no pipe
-    tcp_send(client_socket, buffer_slice(&b), flags=0x4000);
-    buffer_destroy(&b);
 
-    c = s^.clients[nc.id];
-    rb := [1024]byte{};
-    frame_arena := arena_make(1024*16);
-    while true {
-        n := tcp_recv(c.socket, rb[:]);
-        if n <= 0 {
-            println("revceived {} bytes from client. killing.", n);
-            break;
-        }
-        bf := buffer_wrap(rb[:n]);
-        m := Message{0, { nufin = 0 }};
-        if !unpack_message(&bf,&m, arena_allocator(&frame_arena)) {
-            v := 0;
-            for i in rb[:n] {
-                println(v, i);
-            }
-            println("failed to unpack message");
-            break;
-        }
-        if m.kind == MK_UPDATE {
-            uk := m.data.update.kind;
-            if uk == UPDATE_MOVE_TO {
-                p := m.data.update.data.move_to;
-                mutex_lock(&s^.state_mutex);
-                // s^.entities[c.entity_id].pos = m.data.update.pos;
-                // s^.entities[c.entity_id].dir = m.data.update.dir;
-                // s^.entities[c.entity_id].d = m.data.update.d;
-                s^.clients[c.id].move_to = p;
-                mutex_unlock(&s^.state_mutex);
-            } else {
-                println("Invalid update message kind form user: {} (got {}).", c.id, uk);
-                break;
-            }
+    tgt := b^.target_id;
+    lost := tgt < 0 || !s^.entities[tgt].active || s^.entities[tgt].kind != EK_PLAYER;
+
+    if lost || dist(e^.pos, b^.home) > ed.aggro * 3.0 {
+        b^.target_id = -1;
+        b^.ai_state = AI_IDLE;
+        b^.move_to = b^.home;
+        b^.moving = true;
+        b^.timer = 2.0;
+        return;
+    }
+
+    tp := s^.entities[tgt].pos;
+    reach: f32 = 0.6;
+
+    if dist(e^.pos, tp) > reach {
+        b^.ai_state = AI_CHASE;
+        b^.move_to = tp;
+        b^.moving = true;
+    } else {
+        b^.ai_state = AI_ATTACK;
+        b^.moving = false;
+        b^.timer -= dt;
+        if b^.timer <= 0 {
+            b^.timer = 1.0;
+            // TODO: damage target
         }
     }
-    remove_client(s, c.id);
-    arena_destroy(&frame_arena);
-    free(cast(rawptr)payload);
 }
+
+fn ai_hostile_interact(s: ^State, id: int, by: int) {
+    e := &s^.entities[id];
+    e^.hp -= 3;
+    println("hostile {} hit by {}, hp {}", id, by, e^.hp);
+
+    if e^.hp <= 0 {
+        delete_entity(s, id);
+        return;
+    }
+
+    b := &s^.brains[id];
+    if b^.ai_state == AI_IDLE {
+        b^.target_id = by;
+        b^.ai_state = AI_CHASE;
+    }
+}
+
+fn ai_for(kind: int): AiFns {
+    if kind == EK_NPC {
+        return AiFns{ think = ai_npc_think, interact = ai_npc_interact };
+    }
+    if kind == EK_HOSTILE {
+        return AiFns{ think = ai_hostile_think, interact = ai_hostile_interact };
+    }
+    return AiFns{ think = ai_none_think, interact = ai_none_interact };
+}
+
+// ============================================================
+// Simulation
+// ============================================================
+
+fn step_movement(s: ^State, id: int, dt: f32) {
+    b := &s^.brains[id];
+    if !b^.moving { return; }
+
+    e := &s^.entities[id];
+    ed := get_def(e^.def);
+
+    dv := Vector2{b^.move_to.x - e^.pos.x, b^.move_to.y - e^.pos.y};
+    stride := ed.speed * dt;
+
+    if Vector2Length(dv) <= stride {
+        e^.pos = b^.move_to;
+        b^.moving = false;
+        return;
+    }
+
+    dn := Vector2Normalize(dv);
+    e^.pos.x += dn.x * stride;
+    e^.pos.y += dn.y * stride;
+
+    nd := -atan2f(dv.x, dv.y) / (PI / 2);
+    if nd < 0 {
+        nd += 4;
+    }
+    e^.d = nd;
+}
+
+// caller holds state_mutex
+fn update_state(s: ^State, dt: f32 = 0.01 /* for now ig */) {
+    i := 0;
+    while i < MAX_ENTITIES {
+        if s^.entities[i].active {
+            ai := ai_for(s^.entities[i].kind);
+            ai.think(s, i, dt);
+            // think can delete the entity
+            if s^.entities[i].active {
+                step_movement(s, i, dt);
+            }
+        }
+        i += 1;
+    }
+}
+
+fn try_interact(s: ^State, actor: int, target: int) {
+    println("Interact with", target);
+    if target < 0 || target >= MAX_ENTITIES { return; }
+    if target == actor || !s^.entities[target].active { return; }
+
+    reach: f32 = 2.0;
+    if dist(s^.entities[actor].pos, s^.entities[target].pos) > reach { return; }
+
+    if (s^.entities[target].flags & (FL_TALKABLE | FL_ATTACKABLE)) == 0 { return; }
+
+    ai := ai_for(s^.entities[target].kind);
+    ai.interact(s, target, actor);
+}
+
+// ============================================================
+// Slots (callers hold state_mutex)
+// ============================================================
 
 fn find_client(s: ^State, id: int): struct { r: bool, id: int } {
     i := 0;
@@ -98,6 +245,7 @@ fn find_client(s: ^State, id: int): struct { r: bool, id: int } {
     }
     return {false, -1};
 }
+
 fn insert_entity(s: ^State, e: Entity): struct { r: bool, id: int } {
     i := 0;
     for v in s^.entities {
@@ -110,7 +258,7 @@ fn insert_entity(s: ^State, e: Entity): struct { r: bool, id: int } {
         ne.id = i;
         ne.active = true;
         s^.entities[i] = ne;
-        mutex_init(&s^.edata[i].lock);
+        s^.brains[i] = Brain{ e.pos, false, e.pos, -1, AI_IDLE, 0.0, -1 };
 
         return {true, i};
     }
@@ -128,7 +276,6 @@ fn delete_entity(s: ^State, id: int): bool {
     }
 
     s^.entities[id].active = false;
-    mutex_destroy(&s^.edata[id].lock);
     return true;
 }
 
@@ -137,7 +284,6 @@ fn insert_client(s: ^State, c: Client, e: Entity): struct { r: bool, id: int } {
         return {false, -1};
     }
 
-    // Find an available client slot first.
     i := 0;
     for v in s^.clients {
         if v.active {
@@ -145,7 +291,6 @@ fn insert_client(s: ^State, c: Client, e: Entity): struct { r: bool, id: int } {
             continue;
         }
 
-        // Allocate the entity independently of the client slot.
         er := insert_entity(s, e);
         if !er.r {
             return {false, -1};
@@ -157,6 +302,7 @@ fn insert_client(s: ^State, c: Client, e: Entity): struct { r: bool, id: int } {
         nc.active = true;
 
         s^.clients[i] = nc;
+        s^.brains[er.id].client_id = i;
         s^.ccount += 1;
 
         return {true, i};
@@ -182,80 +328,155 @@ fn remove_client(s: ^State, id: int): bool {
     delete_entity(s, entity_id);
     return true;
 }
+
+// takes the lock itself, don't call with it held
 fn kill_client(s: ^State, c: Client) {
+    mutex_lock(&s^.state_mutex);
     remove_client(s, c.id);
+    mutex_unlock(&s^.state_mutex);
     tcp_shutdown(c.socket, SHUT_RDWR);
     tcp_close(c.socket);
     println("closed client:", c.id, c.socket.fd);
 }
 
+// ============================================================
+// Threads
+// ============================================================
 
-fn update_state(s: ^State, dt: f32 = 0.01 /* for now ig */) {
-    for c in s^.clients {
-        if !c.active  { continue; }
-        mutex_lock(&s^.edata[c.entity_id].lock);
-            e := s^.entities[c.entity_id];
-            dv := Vector2{
-                c.move_to.x - e.pos.x,
-                c.move_to.y - e.pos.y,
-            };
-            if Vector2Length(dv) > 0.01 {
-                d := Vector2Normalize(dv);
-                d.x *= dt*1.2;
-                d.y *= dt*1.2;
-                e.pos = Vector2Add(e.pos, d);
-                nd := -atan2f(dv.x, dv.y) / (PI / 2);
+struct hc_payload { clients_socket: TcpSocket, s: ^State }
+fn handle_client(payload: ^hc_payload) {
+    client_socket := payload^.clients_socket;
+    s := payload^.s;
 
-                if nd < 0 {
-                    nd += 4;
-                }
-                e.d = nd;
-            }
-                    
-            s^.entities[c.entity_id] = e;
-        mutex_unlock(&s^.edata[c.entity_id].lock);
+    println("fd:", client_socket.fd);
+
+    c := Client{true, -1, client_socket, -1};
+    e := make_entity(DEF_PLAYER, EK_PLAYER, {2, 2}, 0);
+
+    mutex_lock(&s^.state_mutex);
+    nc := insert_client(s, c, e);
+    if nc.r {
+        c = s^.clients[nc.id];
     }
+    mutex_unlock(&s^.state_mutex);
+
+    if !nc.r {
+        println("Failed to insert client?");
+        free(cast(rawptr)payload);
+        return;
+    }
+    println("Cliend id:", c.id);
+
+    // send entity id
+    b := buffer_make(64);
+    buffer_write(&b, c.entity_id);
+    // no pipe
+    tcp_send(client_socket, buffer_slice(&b), flags=0x4000);
+    buffer_destroy(&b);
+
+    rb := [1024]byte{};
+    frame_arena := arena_make(1024*16);
+    while true {
+        n := tcp_recv(c.socket, rb[:]);
+        if n <= 0 {
+            println("revceived {} bytes from client. killing.", n);
+            break;
+        }
+        bf := buffer_wrap(rb[:n]);
+        m := Message{0, { nufin = 0 }};
+        if !unpack_message(&bf,&m, arena_allocator(&frame_arena)) {
+            v := 0;
+            for i in rb[:n] {
+                println(v, i);
+            }
+            println("failed to unpack message");
+            break;
+        }
+        if m.kind == MK_UPDATE {
+            uk := m.data.update.kind;
+            if uk == UPDATE_MOVE_TO {
+                p := m.data.update.data.move_to;
+                mutex_lock(&s^.state_mutex);
+                s^.brains[c.entity_id].move_to = p;
+                s^.brains[c.entity_id].moving = true;
+                mutex_unlock(&s^.state_mutex);
+            } else if uk == UPDATE_INTERACT_ENTITY {
+                target := m.data.update.data.interact;
+                mutex_lock(&s^.state_mutex);
+                try_interact(s, c.entity_id, target);
+                mutex_unlock(&s^.state_mutex);
+            } else {
+                println("Invalid update message kind form user: {} (got {}).", c.id, uk);
+                break;
+            }
+        } else {
+            println("Invalid message kind form user: {} (got {}).", c.id, m.kind);
+            break;
+        }
+    }
+
+    mutex_lock(&s^.state_mutex);
+    remove_client(s, c.id);
+    mutex_unlock(&s^.state_mutex);
+
+    arena_destroy(&frame_arena);
+    free(cast(rawptr)payload);
 }
+
 fn sender_thread(s: ^State) {
-    entities := [1024]Entity{};
+    entities := [MAX_ENTITIES]Entity{};
+    targets := [MAX_ENTITIES]Client{};
     b := buffer_make(1024);
     while s^.on {
         sleep_ms(10);
-        update_state(s);
-        if s^.ccount <= 0 {
-            continue; // no clients to send to
-        }
+
+        // tick and snapshot under the lock, send outside it
         mutex_lock(&s^.state_mutex);
+        update_state(s);
         l := 0;
+        nt := 0;
         i := 0;
-        for e in s^.entities {
-            if e.active {
-                mutex_lock(&s^.edata[i].lock);
-                entities[l] = e;
-                mutex_unlock(&s^.edata[i].lock);
+        while i < MAX_ENTITIES {
+            if s^.entities[i].active {
+                entities[l] = s^.entities[i];
                 l += 1;
+            }
+            if s^.clients[i].active {
+                targets[nt] = s^.clients[i];
+                nt += 1;
             }
             i += 1;
         }
         mutex_unlock(&s^.state_mutex);
+
+        if nt <= 0 {
+            continue; // no clients to send to
+        }
+
         msg := Message { MK_STATE, { state = { entities[:l] } } };
         if !pack_message(msg, &b) {
             println("failed to pack message");
             buffer_clear(&b);
             return;
         }
-        for c in s^.clients {
-            if !c.active { continue; }
-            // n := tcp_send(c.socket, buffer_slice(&b), flags=0x4000);
+
+        k := 0;
+        while k < nt {
+            c := targets[k];
             n := tcp_send(c.socket, bytes_from(b.data, b.length), flags=0x4000);
             if n != b.length {
-                kill_client(s, c);
                 println("failed to send all bytes to", c.id);
-                continue;
+                kill_client(s, c);
             }
+            k += 1;
         }
         buffer_clear(&b);
     }
+}
+
+fn spawn(s: ^State, def: int, kind: int, pos: Vector2, flags: int): int {
+    r := insert_entity(s, make_entity(def, kind, pos, flags));
+    return r.id;
 }
 
 fn main(): i32 {
@@ -265,16 +486,17 @@ fn main(): i32 {
         return -1;
     }
     s := new::<State>();
+    mutex_init(&s^.state_mutex);
 
-    st := thread_spawn(sender_thread, s);
+    // before the sender thread exists, so no lock needed
+    spawn(s, DEF_VILLAGER, EK_NPC, {4, 4}, FL_TALKABLE);
+    spawn(s, DEF_VILLAGER, EK_NPC, {6, 4}, FL_TALKABLE);
+    spawn(s, DEF_SLIME, EK_HOSTILE, {10, 10}, FL_ATTACKABLE);
+    spawn(s, DEF_SLIME, EK_HOSTILE, {12, 10}, FL_ATTACKABLE);
 
     s^.on = true;
+    st := thread_spawn(sender_thread, s);
 
-    insert_entity(s, {true, -1, {20, 20}, {0, 0}, PI/2*3});
-    insert_entity(s, {true, -1, {40, 20}, {0, 0}, PI/2*3});
-    insert_entity(s, {true, -1, {4, 4}, {0, 0}, PI/2*3});
-    insert_entity(s, {true, -1, {0.5, 0.5}, {0, 0}, PI/2*3});
-    insert_entity(s, {true, -1, {1, 0.5}, {0, 0}, PI/2*3});
     while s^.on  {
         println("Accepting connection.");
         c := tcp_accept(listener);
@@ -289,7 +511,7 @@ fn main(): i32 {
         thread_spawn(handle_client, payload);
     }
     thread_join(st);
-    
+
     free(cast(rawptr)s);
     println("Closing listener.");
     tcp_close(listener);

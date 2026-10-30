@@ -10,8 +10,6 @@ import "./common.gala";
 
 
 // draw space inverts x axis. that only.
-
-
 I := Matrix { [16]f32{
     1, 0, 0, 0,
     0, 1, 0, 0,
@@ -231,7 +229,14 @@ fn draw_ui_button(s: ^State, b: ItemUIButton) {
 fn p_in_rect(p: Vector2, r: Rectangle): bool {
     return (p.x >= r.x && p.x <= (r.x + r.w)) && (p.y >= r.y && p.y <= (r.y + r.h));
 }
-sounds := [5]Sound{ };
+sounds := [5]Sound{};
+fn send_fuckass_interact_request(s: ^State, target: int) {
+    data := [1024]byte{};
+    b := buffer_wrap(data[:]);
+    buffer_clear(&b);
+    pack_message({ kind = MK_UPDATE, data = { update = { UPDATE_INTERACT_ENTITY, { interact = target } } } },&b,  );
+    tcp_send(s^.server_conn, buffer_slice(&b));
+}
 fn main() {
     // SetTraceLogLevel(LOG_WARNING);
     s := new_state();
@@ -248,11 +253,11 @@ fn main() {
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, clone_cstring("Hello, Raylib!", allocator));
     InitAudioDevice();
     sounds = [5]Sound{
-        LoadSound(clone_cstring("assets/duck1.mp3", allocator)),
-        LoadSound(clone_cstring("assets/duck2.mp3", allocator)),
-        LoadSound(clone_cstring("assets/duck3.mp3", allocator)),
-        LoadSound(clone_cstring("assets/duck4.mp3", allocator)),
-        LoadSound(clone_cstring("assets/duck5.mp3", allocator)),
+        LoadSound(clone_cstring("assets/duck1_2.mp3", allocator)),
+        LoadSound(clone_cstring("assets/duck2_2.mp3", allocator)),
+        LoadSound(clone_cstring("assets/duck3_2.mp3", allocator)),
+        LoadSound(clone_cstring("assets/duck4_2.mp3", allocator)),
+        LoadSound(clone_cstring("assets/duck5_2.mp3", allocator)),
     };
     SetTargetFPS(60);
     rs := thread_spawn(receiver_loop, s);
@@ -358,16 +363,17 @@ fn main() {
             e := s^.entities[i];
             if e.id == self.id {  i += 1; continue; }
             if Vector2Length(Vector2Subtract(self.pos, e.pos)) < 1 {
-                slog(s, "Talk to", e.id);
                 f := fn(v: rawptr, event: UIEvent){
-                    data := cast(^struct { id: int, sounds: []Sound, })v;
+                    data := (cast(^struct { id: int, sounds: []Sound, s: ^State })v)^;
                     i := GetRandomValue(0, len(sounds) - 1);
-                    println("talking to", data^.id, i);
+                    i = cast(i32)data.id % len(sounds);
+                    send_fuckass_interact_request(data.s, data.id);
                     PlaySound(sounds[i]);
                 };
-                data := new::<struct { id: int, sounds: []Sound, }>(a);
+                data := new::<struct { id: int, sounds: []Sound, s: ^State }>(a);
                 data^.id = e.id;
                 data^.sounds = sounds[:];
+                data^.s = s;
                 add_ui_button(s, {{SCREEN_WIDTH/2 + 80, SCREEN_HEIGHT/2 + 50 * itemc},
                                 tprint(a, "Talk to", e.id), f, cast(rawptr)data});
                 itemc += 1;

@@ -17,23 +17,46 @@ UPDATE_MOVE_TO :: 1 << 0;
 UPDATE_INTERACT_ENTITY :: 1 << 1;
 UPDATE_INTERACT_ITEM :: 1 << 2;
 
-// bytes per entity on the wire: id 8 + pos 8 + dir 8 + d 4
-ENTITY_WIRE_SIZE :: 28;
+// bytes per entity on the wire: id 8 + pos 8 + d 4 + flags, kind, def, hp 4*8
+ENTITY_WIRE_SIZE :: 52;
 MAX_FRAME_BODY   :: 16 + ENTITY_WIRE_SIZE * MAX_ENTITIES;
+
+DEF_PLAYER  :: 0;
+DEF_VILLAGER :: 1;
+DEF_SLIME   :: 2;
+
+EK_PLAYER  :: 0;
+EK_NPC     :: 1;
+EK_HOSTILE :: 2;
+
+FL_ATTACKABLE :: 1 << 0;
+FL_TALKABLE   :: 1 << 1;
 
 // ============================================================
 // Types
 // ============================================================
 
+struct EntityDef {
+    name: string,
+    max_hp: int,
+    speed: f32,
+    sprite: int,
+    aggro: f32,
+}
+
 struct Entity {
     active: bool,
     id: int,
-    pos, dir: Vector2,
+    pos: Vector2,
     d: f32,
+    flags: int,
+    kind: int,
+    def: int,
+    hp: int,
 }
 
 fn empty_entity(): Entity {
-    return {false, -1, {0, 0}, {0, 0}, 0};
+    return {false, -1, {0, 0}, 0, 0, 0, 0, 0};
 }
 
 struct Message {
@@ -81,33 +104,17 @@ fn pack_entities(entities: []Entity, buffer: ^Buffer): bool {
     i: i64 = 0;
 
     for e in entities {
-        if !buffer_write(b, e.id) {
-            println("[PACK_ENTITIES] ERROR: Failed to write entity ID at index ", i);
-            return false;
-        }
+        ok := buffer_write(b, e.id)
+            && buffer_write(b, e.pos.x)
+            && buffer_write(b, e.pos.y)
+            && buffer_write(b, e.d)
+            && buffer_write(b, e.flags)
+            && buffer_write(b, e.kind)
+            && buffer_write(b, e.def)
+            && buffer_write(b, e.hp);
 
-        if !buffer_write(b, e.pos.x) {
-            println("[PACK_ENTITIES] ERROR: Failed to write pos.x at index ", i);
-            return false;
-        }
-
-        if !buffer_write(b, e.pos.y) {
-            println("[PACK_ENTITIES] ERROR: Failed to write pos.y at index ", i);
-            return false;
-        }
-
-        if !buffer_write(b, e.dir.x) {
-            println("[PACK_ENTITIES] ERROR: Failed to write dir.x at index ", i);
-            return false;
-        }
-
-        if !buffer_write(b, e.dir.y) {
-            println("[PACK_ENTITIES] ERROR: Failed to write dir.y at index ", i);
-            return false;
-        }
-
-        if !buffer_write(b, e.d) {
-            println("[PACK_ENTITIES] ERROR: Failed to write d at index ", i);
+        if !ok {
+            println("[PACK_ENTITIES] ERROR: Failed to write entity at index ", i);
             return false;
         }
 
@@ -139,38 +146,23 @@ fn unpack_entities(
     i: i64 = 0;
 
     while i < l {
-        e := Entity{false, 0, {0, 0}, {0, 0}, 0};
+        e := empty_entity();
 
-        if !buffer_read(b, &e.id) {
-            println("[UNPACK_ENTITIES] ERROR: Failed to read entity ID at index ", i);
+        ok := buffer_read(b, &e.id)
+            && buffer_read(b, &e.pos.x)
+            && buffer_read(b, &e.pos.y)
+            && buffer_read(b, &e.d)
+            && buffer_read(b, &e.flags)
+            && buffer_read(b, &e.kind)
+            && buffer_read(b, &e.def)
+            && buffer_read(b, &e.hp);
+
+        if !ok {
+            println("[UNPACK_ENTITIES] ERROR: Failed to read entity at index ", i);
             return false;
         }
 
-        if !buffer_read(b, &e.pos.x) {
-            println("[UNPACK_ENTITIES] ERROR: Failed to read pos.x at index ", i);
-            return false;
-        }
-
-        if !buffer_read(b, &e.pos.y) {
-            println("[UNPACK_ENTITIES] ERROR: Failed to read pos.y at index ", i);
-            return false;
-        }
-
-        if !buffer_read(b, &e.dir.x) {
-            println("[UNPACK_ENTITIES] ERROR: Failed to read dir.x at index ", i);
-            return false;
-        }
-
-        if !buffer_read(b, &e.dir.y) {
-            println("[UNPACK_ENTITIES] ERROR: Failed to read dir.y at index ", i);
-            return false;
-        }
-
-        if !buffer_read(b, &e.d) {
-            println("[UNPACK_ENTITIES] ERROR: Failed to read d at index ", i);
-            return false;
-        }
-
+        e.active = true;
         data[i] = e;
         i += 1;
     }
@@ -387,7 +379,9 @@ fn unpack_message(
                 println("[UNPACK_MESSAGE] ERROR: Failed to read interact");
                 return false;
             }
-            message^.data.update.kind = ukind; // could be either
+
+            message^.kind = MK_UPDATE;
+            message^.data.update.kind = ukind;
         } else {
             println("[UNPACK_MESSAGE] ERROR: Unknown update kind: ", ukind);
             return false;
@@ -401,4 +395,15 @@ fn unpack_message(
     // always land exactly on the next frame boundary
     b^.read_pos = start + 8 + cast(int)size;
     return true;
+}
+
+fn get_def(id: int): EntityDef {
+    if id == DEF_VILLAGER { return EntityDef{"duck", 20, 0.4, 1, 0.0}; }
+    if id == DEF_SLIME    { return EntityDef{"slime", 10, 0.6, 2, 3.0}; }
+    return EntityDef{"player", 100, 1.2, 0, 0.0};
+}
+
+fn make_entity(def: int, kind: int, pos: Vector2, flags: int): Entity {
+    dd := get_def(def);
+    return {true, -1, pos, 0, flags, kind, def, dd.max_hp};
 }
