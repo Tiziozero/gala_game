@@ -237,7 +237,6 @@ fn sender_thread(s: ^State) {
             }
             i += 1;
         }
-        println("{} entities", l);
         mutex_unlock(&s^.state_mutex);
         msg := Message { MK_STATE, { state = { entities[:l] } } };
         if !pack_message(msg, &b) {
@@ -245,9 +244,11 @@ fn sender_thread(s: ^State) {
             buffer_clear(&b);
             return;
         }
+        println("bytes:", b.length);
         for c in s^.clients {
             if !c.active { continue; }
-            n := tcp_send(c.socket, buffer_slice(&b), flags=0x4000);
+            // n := tcp_send(c.socket, buffer_slice(&b), flags=0x4000);
+            n := tcp_send(c.socket, bytes_from(b.data, b.length), flags=0x4000);
             if n != b.length {
                 kill_client(s, c);
                 println("failed to send all bytes to", c.id);
@@ -274,6 +275,7 @@ fn main(): i32 {
     insert_entity(s, {true, -1, {40, 20}, {0, 0}, PI/2*3});
     insert_entity(s, {true, -1, {4, 4}, {0, 0}, PI/2*3});
     insert_entity(s, {true, -1, {0.5, 0.5}, {0, 0}, PI/2*3});
+    insert_entity(s, {true, -1, {1, 0.5}, {0, 0}, PI/2*3});
     while s^.on  {
         println("Accepting connection.");
         c := tcp_accept(listener);

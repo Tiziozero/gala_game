@@ -20,15 +20,25 @@ I := Matrix { [16]f32{
     }
 };
 
+UI_BUTTON :: 1;
+struct UIItem {
+    kind: int,
+    item: union {
+        button: ItemUIButton,
+    }
+}
 struct State {
     state_mutex:    Mutex,
     server_conn:    TcpSocket,
     entities:       []Entity,
     entity_capacity, entity_count: i64,
     frame_arena:      Arena,
+    init_arena:      Arena,
     log_arena:      Arena,
     log_builder:    StringBuilder,
     log_index:      i32,
+    ui_items:       [1024]UIItem,
+    ui_item_count:  int,
     on:             bool,
 }
 
@@ -79,13 +89,16 @@ fn replace_entities(s: ^State, incoming: []Entity) {
     s^.entity_count = count;
     mutex_unlock(&s^.state_mutex);
 }
+// sometimes, receiver would get 1000+ bytes message. claude suggested it's tcp
+// packing multiple fast messages together, so basically batch input and read as needed
 fn receiver_loop(s: ^State) {
-    // idk bruh guess
-    buffer := [1024*4]byte{};
+    acc := [1024*128]byte{};
+    filled := 0;
     frame_arena := arena_make(1024*16);
-    msg: Message={0, {nufin=0}}; 
+    msg: Message = {0, {nufin=0}};
+
     while s^.on {
-        n := tcp_recv(s^.server_conn, buffer[:]);
+        n := tcp_recv(s^.server_conn, acc[filled:]);
         if n <= 0 {
             if n == -1 {
                 println("no data");
@@ -93,23 +106,50 @@ fn receiver_loop(s: ^State) {
             }
             println("Received 0 from server.");
             s^.on = false;
-            return;
+            break;
         }
-        b := buffer_wrap(buffer[:n]);
-        if !unpack_message(&b, &msg, arena_allocator(&frame_arena)) {
-            println("failed to unpack message?");
-            v := 0;
-            for i in buffer[:n] {
-                println(v, i);
+        filled += n;
+
+        pos := 0;
+
+        while pos < filled {
+            b := buffer_wrap(acc[pos:filled]);
+            total := frame_size(&b);
+
+            if total < 0 {
+                println("bad frame size");
+                s^.on = false;
+                break;
             }
-            continue;
-        }
-        if msg.kind == MK_STATE {
-            replace_entities(s, msg.data.state.entities);
+
+            if total == 0 {
+                break;
+            }
+
+            if !unpack_message(&b, &msg, arena_allocator(&frame_arena)) {
+                println("failed to unpack message?");
+                s^.on = false;
+                break;
+            }
+
+            if msg.kind == MK_STATE {
+                replace_entities(s, msg.data.state.entities);
+            }
+
+            arena_reset(&frame_arena);
+            pos += total;
         }
 
-        arena_reset(&frame_arena);
+        // move the partial frame (if any) to the front
+        rest := filled - pos;
+        j := 0;
+        while j < rest {
+            acc[j] = acc[pos + j];
+            j += 1;
+        }
+        filled = rest;
     }
+
     arena_destroy(&frame_arena);
     println("end receiver loop");
 }
@@ -144,28 +184,100 @@ fn mouse_to_ground(camera: Camera3D): Vector2 {
 }
 SCREEN_WIDTH :: 800;
 SCREEN_HEIGHT :: 500;
-fn main() {
+
+
+struct UIButton {
+    p: Vector2,
+    text: string,
+    callback: fn(data: rawptr, event: UIEvent),
+    data: rawptr,
+}
+struct ItemUIButton {
+    body: Rectangle,
+    text: string,
+    cstring: ^byte,
+    callback: fn(data: rawptr, event: UIEvent),
+    data: rawptr,
+}
+
+UI_EVENT_NONE         :: 0;
+UI_EVENT_MOUSE_MOVE   :: 1;
+UI_EVENT_MOUSE_DOWN   :: 2;
+UI_EVENT_MOUSE_UP     :: 3;
+UI_EVENT_MOUSE_WHEEL  :: 4;
+
+struct UIEvent {
+    kind: i32,
+    consumed: bool,
+    event: union {
+        mouse_down: struct {
+            x, y: i32,
+            button: i32,
+        },
+        mouse_up: struct {
+            x, y: i32,
+            button: i32,
+        },
+        mouse_wheel: struct {
+            x, y: i32,
+            move: f32,
+        },
+    },
+}
+fn new_state(): ^State {
     server_conn := tcp_connect("127.0.0.1", 1234);
     if server_conn.fd < 0 {
         println("Failed to init server connection");
-        return;
+        return 0;
     }
 
     result := tcp_set_recv_timeout(server_conn, 3, 0);
     if result < 0 {
         println("failed to set receive timeout");
-        return;
+        return 0;
     }
-    init_arena := arena_make(1024*1024); // 1MB
-    allocator := arena_allocator(&init_arena);
-    s := new::<State>(allocator);
-    s^.entities = make_slice::<Entity>(0, heap_allocator());
+    s := new::<State>(); // just heap
+    s^.init_arena = arena_make(1024*1024); // 1MB
+    s^.entities = make_slice::<Entity>(0);
     s^.entity_count = 0;
     s^.entity_capacity = 0;
     s^.server_conn = server_conn;
     s^.on = true;
     mutex_init(&s^.state_mutex);
+    return s;
+}
+fn add_ui_button(s: ^State, b: UIButton) {
+    cw : f32= 40;
+    ch : f32= 40;
+    str := clone_cstring(b.text, arena_allocator(&s^.frame_arena));
+    cw = cast(f32)MeasureText(str, 20) + 20 + 20;
+    s^.ui_items[s^.ui_item_count] = {UI_BUTTON, { button = ItemUIButton{
+        body = {b.p.x, b.p.y, cw, ch},
+        text = b.text,
+        cstring = str,
+        callback = b.callback,
+        data = b.data,
+        } }};
+    s^.ui_item_count += 1;
+}
+fn draw_ui_button(s: ^State, b: ItemUIButton) {
+    DrawRectangleRounded({b.body.x, b.body.y, b.body.w, b.body.h}, 1, 0, {0,0,0,175});
+    DrawRectangleRoundedLines({b.body.x, b.body.y, b.body.w, b.body.h}, 1, 0, {255, 255, 255, 255});
+    DrawText(b.cstring, cast(i32)b.body.x + 20, cast(i32)b.body.y + 10, 20, {255, 255, 255, 255});
+}
 
+
+fn p_in_rect(p: Vector2, r: Rectangle): bool {
+    return (p.x >= r.x && p.x <= (r.x + r.w)) && (p.y >= r.y && p.y <= (r.y + r.h));
+}
+fn main() {
+    SetTraceLogLevel(LOG_WARNING);
+    s := new_state();
+    if s == 0 {
+        println("Failed to init state.");
+        return;
+    }
+    allocator := arena_allocator(&s^.init_arena);
     initmsgrecv:=[1024]byte{};
     initn := tcp_recv(s^.server_conn, initmsgrecv[:]);
     initb := buffer_wrap(initmsgrecv[:initn]);
@@ -178,8 +290,6 @@ fn main() {
     model_path := "./duck.obj";
     scale : f32 = 1.5;
 
-    model_path = "assets/B3.glb";
-    scale = 0.4;
     model := LoadModel(clone_cstring(model_path, allocator));
     camera := Camera3D {
         position = { 5.0, 4.0, 5.0 },
@@ -204,14 +314,13 @@ fn main() {
     s^.frame_arena  = arena_make(1024*1024); // 1MB
     s^.log_arena    = arena_make(1024*1024); // 1MB
 
-    // Releases the builder's storage logically through the arena,
-    // then releases the arena's entire backing allocation.
-    // sb_free(&sb);
-
     frame: f32 = 0;
     zoom: f32 = 5;
     self := empty_entity();
+    // input -> update state -> draw
+    // input is based on previous state
     while !WindowShouldClose() && s^.on {
+        // find self first
         i := 0;
         while i < s^.entity_count {
             e := s^.entities[i];
@@ -222,11 +331,43 @@ fn main() {
         slog(s, id);
         slog(s, self.pos.x, self.pos.y);
         v = { 0, 0 };
+
+        // ===== INPUT =====
+        events := [5]UIEvent{};
+        event_count := 0;
+        mx := GetMouseX();
+        my := GetMouseY();
+
+        if IsMouseButtonPressed(MOUSE_BUTTON_LEFT) {
+            events[event_count] = UIEvent{
+                consumed = false,
+                kind = UI_EVENT_MOUSE_DOWN,
+                event = { mouse_down = {mx, my, MOUSE_BUTTON_LEFT} },
+            };
+            event_count += 1;
+        }
+
+        if IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) {
+            events[event_count] = UIEvent{
+                consumed = false,
+                kind = UI_EVENT_MOUSE_DOWN,
+                event = { mouse_down = {mx, my, MOUSE_BUTTON_RIGHT} },
+            };
+            event_count += 1;
+        }
+
         mw := GetMouseWheelMove();
-        if mw > 0 { zoom += 0.1; }
-        if mw < 0 { zoom -= 0.1; }
-        if zoom < 2 { zoom = 2; }
-        if zoom > 10 { zoom = 10; }
+        if mw != 0 {
+            events[event_count] = UIEvent{
+                consumed = false,
+                kind = UI_EVENT_MOUSE_WHEEL,
+                event = { mouse_wheel = {mx, my, mw} },
+            };
+            event_count += 1;
+        }
+
+
+        // ===== UPDATE =====
         // target and some bullshit going on here.
         camera.position.x = zoom*camabc.x + -self.pos.x;
         camera.position.y = zoom*camabc.y;
@@ -234,13 +375,80 @@ fn main() {
         camera.target.x = -self.pos.x;
         camera.target.y = 0.5;
         camera.target.z =  self.pos.y;
+        // UI and dialouges
+        i = 0;
+        a := arena_allocator(&s^.frame_arena);
+        itemc: f32 = 0;
+        while i < s^.entity_count {
+            e := s^.entities[i];
+            if e.id == self.id {  i += 1; continue; }
+            if Vector2Length(Vector2Subtract(self.pos, e.pos)) < 1 {
+                slog(s, "Talk to", e.id);
+                f := fn(v: rawptr, event: UIEvent){
+                    data := cast(^struct { id: int })v;
+                    println("talking to", data^.id);
+                };
+                data := new::<struct { id: int }>(a);
+                data^.id = e.id;
+                add_ui_button(s, {{SCREEN_WIDTH/2 + 80, SCREEN_HEIGHT/2 + 50 * itemc},
+                                tprint(a, "Talk to", e.id), f, cast(rawptr)data});
+                itemc += 1;
+            }
+            i+=1;
+        }
+        // dispatch inputs
+        i = 0;
+        while i < s^.ui_item_count {
+            item := s^.ui_items[i];
+            j := 0;
+            while j < event_count {
+                if events[j].consumed {
+                    j += 1;
+                    continue;
+                }
+                event := events[j];
+                if item.kind == UI_BUTTON {
+                    b := item.item.button;
+                    if event.kind == UI_EVENT_MOUSE_DOWN {
+                        e := event.event.mouse_down;
+                        if p_in_rect({cast(f32)e.x, cast(f32)e.y}, b.body) {
+                            b.callback(b.data, event);
+                            events[j].consumed = true;
+                        }
+                    }
+                } else {
+                    println("Invalid ui item kind", item.kind);
+                    s^.on = false;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        // rest goes to game
+        for e in events {
+            if e.consumed { continue; }
+            if e.kind == UI_EVENT_MOUSE_WHEEL {
+                if mw > 0 { zoom += 0.1; }
+                if mw < 0 { zoom -= 0.1; }
+                if zoom < 2 { zoom = 2; }
+                if zoom > 10 { zoom = 10; }
+            }
 
+            if e.kind == UI_EVENT_MOUSE_DOWN && e.event.mouse_down.button == MOUSE_BUTTON_RIGHT {
+                target := mouse_to_ground(camera);
+                buffer_clear(&bf);
+                pack_message({MK_UPDATE, { update = { UPDATE_MOVE_TO, { move_to = target } }  } }, &bf);
+                tcp_send(s^.server_conn, buffer_slice(&bf));
+                buffer_clear(&bf);
+            }
+        }
+
+        // ===== DRAW =====
         BeginDrawing();
         ClearBackground({0,0,0,255});
+        // game itself
         BeginMode3D(camera);
         DrawGrid(20, 1.0);
-
-
         // only first "entity_count" entities are relevant
         i = 0;
         while i < s^.entity_count {
@@ -252,50 +460,35 @@ fn main() {
             i += 1;
         }
         EndMode3D();
-        // dialouges
-        i = 0;
-        a := arena_allocator(&s^.frame_arena);
-        while i < s^.entity_count {
-            e := s^.entities[i];
-            if e.id == self.id {  i += 1; continue; }
-            if Vector2Length(Vector2Subtract(self.pos, e.pos)) < 1 {
-                slog(s, "Talk to", e.id);
-                DrawRectangleRounded({SCREEN_WIDTH/2 + 80, SCREEN_HEIGHT/2, 200, 40 }, 1, 0, {0,0,0,175});
-                DrawRectangleRoundedLines({SCREEN_WIDTH/2 + 80, SCREEN_HEIGHT/2, 200, 40 }, 1, 0, {255, 255, 255, 255});
-                str := clone_cstring(tprint(a, "Talk to", e.id), a);
-                DrawText(str, SCREEN_WIDTH/2 + 80 + 20, SCREEN_HEIGHT/2  + 10, 20, {255, 255, 255, 255});
+
+        for item in s^.ui_items[:s^.ui_item_count] {
+            if item.kind == UI_BUTTON {
+                draw_ui_button(s, item.item.button);
             }
-            i+=1;
-        }
-        if IsMouseButtonDown(MOUSE_BUTTON_LEFT) {
-            target := mouse_to_ground(camera);
-        }
-        if IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) {
-            target := mouse_to_ground(camera);
-            buffer_clear(&bf);
-            pack_message({MK_UPDATE, { update = { UPDATE_MOVE_TO, { move_to = target } }  } }, &bf);
-            tcp_send(s^.server_conn, buffer_slice(&bf));
-            buffer_clear(&bf);
         }
         DrawFPS(10, 10);
         EndDrawing();
-        // pack_message({MK_UPDATE, { update = {{p.x, p.y}, {0, 0} , d} } }, &bf);
-        // tcp_send(s^.server_conn, buffer_slice(&bf));
-        // buffer_clear(&bf);
+        // reset relevant things
         arena_reset(&s^.frame_arena);
         arena_reset(&s^.log_arena);
         s^.log_index = 0;
+        s^.ui_item_count = 0;
     }
     s^.on = false;
     thread_join(rs);
+    UnloadModel(model);
+    kill_state(s);
+    CloseWindow();
+}
+
+fn kill_state(s: ^State) {
     mutex_destroy(&s^.state_mutex);
     del_slice(s^.entities, heap_allocator());
-    tcp_shutdown(server_conn, SHUT_RDWR);
-    tcp_close(server_conn);
+    tcp_shutdown(s^.server_conn, SHUT_RDWR);
+    tcp_close(s^.server_conn);
     mutex_destroy(&s^.state_mutex);
     arena_destroy(&s^.frame_arena);
     arena_destroy(&s^.log_arena);
-    arena_destroy(&init_arena);
-    UnloadModel(model);
-    CloseWindow();
+    arena_destroy(&s^.init_arena);
+    free(cast(rawptr)s);
 }

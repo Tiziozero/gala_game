@@ -13,7 +13,11 @@ MK_UPDATE   :: 1 << 3;
 
 MAX_ENTITIES :: 4096;
 
-UPDATE_MOVE_TO :: 1<<0;
+UPDATE_MOVE_TO :: 1 << 0;
+
+// bytes per entity on the wire: id 8 + pos 8 + dir 8 + d 4
+ENTITY_WIRE_SIZE :: 28;
+MAX_FRAME_BODY   :: 16 + ENTITY_WIRE_SIZE * MAX_ENTITIES;
 
 // ============================================================
 // Types
@@ -25,8 +29,9 @@ struct Entity {
     pos, dir: Vector2,
     d: f32,
 }
+
 fn empty_entity(): Entity {
-    return {false, -1, {0,0}, {0,0}, 0};
+    return {false, -1, {0, 0}, {0, 0}, 0};
 }
 
 struct Message {
@@ -61,20 +66,49 @@ fn pack_entities(entities: []Entity, buffer: ^Buffer): bool {
     l := cast(i64)len(entities);
 
     if l < 0 || l > MAX_ENTITIES {
+        println("[PACK_ENTITIES] ERROR: Invalid entity count: ", l);
         return false;
     }
 
     if !buffer_write(b, l) {
+        println("[PACK_ENTITIES] ERROR: Failed to write entity count");
         return false;
     }
 
+    i: i64 = 0;
+
     for e in entities {
-        if !buffer_write(b, e.id)       { return false; }
-        if !buffer_write(b, e.pos.x)    { return false; }
-        if !buffer_write(b, e.pos.y)    { return false; }
-        if !buffer_write(b, e.dir.x)    { return false; }
-        if !buffer_write(b, e.dir.y)    { return false; }
-        if !buffer_write(b, e.d)        { return false; }
+        if !buffer_write(b, e.id) {
+            println("[PACK_ENTITIES] ERROR: Failed to write entity ID at index ", i);
+            return false;
+        }
+
+        if !buffer_write(b, e.pos.x) {
+            println("[PACK_ENTITIES] ERROR: Failed to write pos.x at index ", i);
+            return false;
+        }
+
+        if !buffer_write(b, e.pos.y) {
+            println("[PACK_ENTITIES] ERROR: Failed to write pos.y at index ", i);
+            return false;
+        }
+
+        if !buffer_write(b, e.dir.x) {
+            println("[PACK_ENTITIES] ERROR: Failed to write dir.x at index ", i);
+            return false;
+        }
+
+        if !buffer_write(b, e.dir.y) {
+            println("[PACK_ENTITIES] ERROR: Failed to write dir.y at index ", i);
+            return false;
+        }
+
+        if !buffer_write(b, e.d) {
+            println("[PACK_ENTITIES] ERROR: Failed to write d at index ", i);
+            return false;
+        }
+
+        i += 1;
     }
 
     return true;
@@ -88,25 +122,51 @@ fn unpack_entities(
     l: i64 = 0;
 
     if !buffer_read(b, &l) {
+        println("[UNPACK_ENTITIES] ERROR: Failed to read entity count");
         return false;
     }
 
     if l < 0 || l > MAX_ENTITIES {
+        println("[UNPACK_ENTITIES] ERROR: Invalid entity count: ", l);
         return false;
     }
 
     data := make_slice::<Entity>(l, allocator);
 
     i: i64 = 0;
-    while i < l {
-        e := Entity{false, 0, { 0, 0 }, { 0, 0 }, 0 };
 
-        if !buffer_read(b, &e.id)       { return false; }
-        if !buffer_read(b, &e.pos.x)    { return false; }
-        if !buffer_read(b, &e.pos.y)    { return false; }
-        if !buffer_read(b, &e.dir.x)    { return false; }
-        if !buffer_read(b, &e.dir.y)    { return false; }
-        if !buffer_read(b, &e.d)        { return false; }
+    while i < l {
+        e := Entity{false, 0, {0, 0}, {0, 0}, 0};
+
+        if !buffer_read(b, &e.id) {
+            println("[UNPACK_ENTITIES] ERROR: Failed to read entity ID at index ", i);
+            return false;
+        }
+
+        if !buffer_read(b, &e.pos.x) {
+            println("[UNPACK_ENTITIES] ERROR: Failed to read pos.x at index ", i);
+            return false;
+        }
+
+        if !buffer_read(b, &e.pos.y) {
+            println("[UNPACK_ENTITIES] ERROR: Failed to read pos.y at index ", i);
+            return false;
+        }
+
+        if !buffer_read(b, &e.dir.x) {
+            println("[UNPACK_ENTITIES] ERROR: Failed to read dir.x at index ", i);
+            return false;
+        }
+
+        if !buffer_read(b, &e.dir.y) {
+            println("[UNPACK_ENTITIES] ERROR: Failed to read dir.y at index ", i);
+            return false;
+        }
+
+        if !buffer_read(b, &e.d) {
+            println("[UNPACK_ENTITIES] ERROR: Failed to read d at index ", i);
+            return false;
+        }
 
         data[i] = e;
         i += 1;
@@ -117,38 +177,124 @@ fn unpack_entities(
 }
 
 // ============================================================
+// Framing
+// Wire format: [i64 body_size][body]
+// ============================================================
+
+// Body size in bytes (without the 8-byte prefix), or -1 if unknown kind.
+fn message_body_size(message: Message): i64 {
+    if message.kind == MK_CONNECT {
+        return 16;
+    }
+
+    if message.kind == MK_STATE {
+        return 16 + cast(i64)len(message.data.state.entities) * ENTITY_WIRE_SIZE;
+    }
+
+    if message.kind == MK_UPDATE {
+        return 24;
+    }
+
+    return -1;
+}
+
+// Looks at the frame at b's read position without consuming anything.
+// Returns total frame bytes (prefix + body) if a full frame is there,
+// 0 if more bytes are needed, -1 if the size is invalid.
+fn frame_size(b: ^Buffer): int {
+    start := b^.read_pos;
+
+    if b^.length - start < 8 {
+        return 0;
+    }
+
+    size: i64 = 0;
+    ok := buffer_read(b, &size);
+    b^.read_pos = start;
+
+    if !ok {
+        return 0;
+    }
+
+    if size <= 0 || size > MAX_FRAME_BODY {
+        return -1;
+    }
+
+    total := cast(int)size + 8;
+
+    if b^.length - start < total {
+        return 0;
+    }
+
+    return total;
+}
+
+// ============================================================
 // Message serialization
 // ============================================================
 
+// Expects a fresh buffer (length = 0) or appends a complete frame.
 fn pack_message(message: Message, buffer: ^Buffer): bool {
     b := buffer;
+    start := b^.length;
+
+    body := message_body_size(message);
+
+    if body < 0 {
+        println("[PACK_MESSAGE] ERROR: Unknown message kind: ", message.kind);
+        return false;
+    }
+
+    if !buffer_write(b, body) {
+        println("[PACK_MESSAGE] ERROR: Failed to write frame size");
+        return false;
+    }
 
     if !buffer_write(b, message.kind) {
+        println("[PACK_MESSAGE] ERROR: Failed to write message kind");
         return false;
     }
 
     if message.kind == MK_CONNECT {
         if !buffer_write(b, message.data.connect.id) {
+            println("[PACK_MESSAGE] ERROR: Failed to write CONNECT id");
             return false;
         }
 
     } else if message.kind == MK_STATE {
         if !pack_entities(message.data.state.entities, b) {
+            println("[PACK_MESSAGE] ERROR: Failed to pack STATE entities");
             return false;
         }
 
     } else if message.kind == MK_UPDATE {
-        println("UPDATE");
-        if !buffer_write(b, cast(int)message.data.update.kind) { return false; }
+        if !buffer_write(b, cast(int)message.data.update.kind) {
+            println("[PACK_MESSAGE] ERROR: Failed to write UPDATE kind");
+            return false;
+        }
+
         if message.data.update.kind == UPDATE_MOVE_TO {
             if !buffer_write(b, message.data.update.data.move_to.x) {
+                println("[PACK_MESSAGE] ERROR: Failed to write MOVE_TO x");
                 return false;
             }
+
             if !buffer_write(b, message.data.update.data.move_to.y) {
+                println("[PACK_MESSAGE] ERROR: Failed to write MOVE_TO y");
                 return false;
             }
-        } else { return false; }
-    } else {
+
+        } else {
+            println("[PACK_MESSAGE] ERROR: Unknown update kind: ", message.data.update.kind);
+            return false;
+        }
+    }
+
+    // catches message_body_size drifting out of sync with the writes
+    written := b^.length - start;
+
+    if written != cast(int)body + 8 {
+        println("[PACK_MESSAGE] ERROR: size mismatch, wrote ", written, " expected ", body + 8);
         return false;
     }
 
@@ -160,9 +306,28 @@ fn unpack_message(
     message: ^Message,
     allocator := base_allocator
 ): bool {
+    start := b^.read_pos;
+    size: i64 = 0;
+
+    if !buffer_read(b, &size) {
+        println("[UNPACK_MESSAGE] ERROR: Failed to read frame size");
+        return false;
+    }
+
+    if size <= 0 || size > MAX_FRAME_BODY {
+        println("[UNPACK_MESSAGE] ERROR: Invalid frame size: ", size);
+        return false;
+    }
+
+    if b^.length - b^.read_pos < cast(int)size {
+        println("[UNPACK_MESSAGE] ERROR: Incomplete frame, need ", size);
+        return false;
+    }
+
     kind: int = 0;
 
     if !buffer_read(b, &kind) {
+        println("[UNPACK_MESSAGE] ERROR: Failed to read message kind");
         return false;
     }
 
@@ -170,6 +335,7 @@ fn unpack_message(
         id: int = 0;
 
         if !buffer_read(b, &id) {
+            println("[UNPACK_MESSAGE] ERROR: Failed to read CONNECT id");
             return false;
         }
 
@@ -180,6 +346,7 @@ fn unpack_message(
         entities: []Entity = ([0]Entity{})[:];
 
         if !unpack_entities(b, &entities, allocator) {
+            println("[UNPACK_MESSAGE] ERROR: Failed to unpack STATE entities");
             return false;
         }
 
@@ -187,22 +354,38 @@ fn unpack_message(
         message^.data.state.entities = entities;
 
     } else if kind == MK_UPDATE {
-        ukind : int = 0; 
-        if !buffer_read(b, &ukind) { return false; }
-        message^.kind = MK_UPDATE;
-        message^.data.update.kind = UPDATE_MOVE_TO;
+        ukind: int = 0;
+
+        if !buffer_read(b, &ukind) {
+            println("[UNPACK_MESSAGE] ERROR: Failed to read UPDATE kind");
+            return false;
+        }
+
         if ukind == UPDATE_MOVE_TO {
             if !buffer_read(b, &message^.data.update.data.move_to.x) {
+                println("[UNPACK_MESSAGE] ERROR: Failed to read MOVE_TO x");
                 return false;
             }
+
             if !buffer_read(b, &message^.data.update.data.move_to.y) {
+                println("[UNPACK_MESSAGE] ERROR: Failed to read MOVE_TO y");
                 return false;
             }
-        } else { return false; }
+
+            message^.kind = MK_UPDATE;
+            message^.data.update.kind = UPDATE_MOVE_TO;
+
+        } else {
+            println("[UNPACK_MESSAGE] ERROR: Unknown update kind: ", ukind);
+            return false;
+        }
+
     } else {
+        println("[UNPACK_MESSAGE] ERROR: Unknown message kind: ", kind);
         return false;
     }
 
+    // always land exactly on the next frame boundary
+    b^.read_pos = start + 8 + cast(int)size;
     return true;
 }
-
