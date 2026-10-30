@@ -244,7 +244,6 @@ fn sender_thread(s: ^State) {
             buffer_clear(&b);
             return;
         }
-        println("bytes:", b.length);
         for c in s^.clients {
             if !c.active { continue; }
             // n := tcp_send(c.socket, buffer_slice(&b), flags=0x4000);

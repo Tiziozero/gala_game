@@ -14,6 +14,8 @@ MK_UPDATE   :: 1 << 3;
 MAX_ENTITIES :: 4096;
 
 UPDATE_MOVE_TO :: 1 << 0;
+UPDATE_INTERACT_ENTITY :: 1 << 1;
+UPDATE_INTERACT_ITEM :: 1 << 2;
 
 // bytes per entity on the wire: id 8 + pos 8 + dir 8 + d 4
 ENTITY_WIRE_SIZE :: 28;
@@ -47,6 +49,7 @@ struct Message {
             kind: int,
             data: union {
                 move_to: Vector2,
+                interact: int, // both entity and item
             }
         },
         old_update: struct {
@@ -283,7 +286,12 @@ fn pack_message(message: Message, buffer: ^Buffer): bool {
                 println("[PACK_MESSAGE] ERROR: Failed to write MOVE_TO y");
                 return false;
             }
-
+        } else if message.data.update.kind == UPDATE_INTERACT_ENTITY ||
+            message.data.update.kind == UPDATE_INTERACT_ITEM {
+            if !buffer_write(b, message.data.update.data.interact) {
+                println("[PACK_MESSAGE] ERROR: Failed to write interact");
+                return false;
+            }
         } else {
             println("[PACK_MESSAGE] ERROR: Unknown update kind: ", message.data.update.kind);
             return false;
@@ -374,7 +382,12 @@ fn unpack_message(
 
             message^.kind = MK_UPDATE;
             message^.data.update.kind = UPDATE_MOVE_TO;
-
+        } else if ukind == UPDATE_INTERACT_ENTITY || ukind == UPDATE_INTERACT_ITEM {
+            if !buffer_read(b, &message^.data.update.data.interact) {
+                println("[UNPACK_MESSAGE] ERROR: Failed to read interact");
+                return false;
+            }
+            message^.data.update.kind = ukind; // could be either
         } else {
             println("[UNPACK_MESSAGE] ERROR: Unknown update kind: ", ukind);
             return false;

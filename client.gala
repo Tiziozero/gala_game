@@ -30,10 +30,14 @@ struct UIItem {
 struct State {
     state_mutex:    Mutex,
     server_conn:    TcpSocket,
-    entities:       []Entity,
-    entity_capacity, entity_count: i64,
-    frame_arena:      Arena,
-    init_arena:      Arena,
+
+    secount, ecount:int,
+    server_entities:[1024]Entity,
+    // own copy with prediction and what not blah blah blah
+    entities:       [1024]Entity,
+
+    frame_arena:    Arena,
+    init_arena:     Arena,
     log_arena:      Arena,
     log_builder:    StringBuilder,
     log_index:      i32,
@@ -42,53 +46,6 @@ struct State {
     on:             bool,
 }
 
-fn replace_entities(s: ^State, incoming: []Entity) {
-    mutex_lock(&s^.state_mutex);
-
-    count := len(incoming);
-
-    if count > s^.entity_capacity {
-        new_capacity := s^.entity_capacity;
-        if new_capacity < 16 {
-            new_capacity = 16;
-        }
-
-        while new_capacity < count {
-            new_capacity *= 2;
-        }
-
-        new_entities := make_slice::<Entity>(
-            new_capacity,
-            heap_allocator(),
-        );
-
-        if len(new_entities) != new_capacity {
-            println("failed to allocate entity storage");
-            mutex_unlock(&s^.state_mutex);
-            return;
-        }
-
-        // Copy the incoming state before replacing the old storage.
-        i := 0;
-        while i < count {
-            new_entities[i] = incoming[i];
-            i += 1;
-        }
-
-        del_slice(s^.entities, heap_allocator());
-        s^.entities = new_entities;
-        s^.entity_capacity = new_capacity;
-    } else {
-        i := 0;
-        while i < count {
-            s^.entities[i] = incoming[i];
-            i += 1;
-        }
-    }
-
-    s^.entity_count = count;
-    mutex_unlock(&s^.state_mutex);
-}
 // sometimes, receiver would get 1000+ bytes message. claude suggested it's tcp
 // packing multiple fast messages together, so basically batch input and read as needed
 fn receiver_loop(s: ^State) {
@@ -133,7 +90,14 @@ fn receiver_loop(s: ^State) {
             }
 
             if msg.kind == MK_STATE {
-                replace_entities(s, msg.data.state.entities);
+                i := 0;
+                while i < len(msg.data.state.entities) {
+                    s^.server_entities[i] = msg.data.state.entities[i];
+                    i += 1;
+                }
+                s^.secount = len(msg.data.state.entities);
+            } else {
+
             }
 
             arena_reset(&frame_arena);
@@ -238,9 +202,6 @@ fn new_state(): ^State {
     }
     s := new::<State>(); // just heap
     s^.init_arena = arena_make(1024*1024); // 1MB
-    s^.entities = make_slice::<Entity>(0);
-    s^.entity_count = 0;
-    s^.entity_capacity = 0;
     s^.server_conn = server_conn;
     s^.on = true;
     mutex_init(&s^.state_mutex);
@@ -270,8 +231,9 @@ fn draw_ui_button(s: ^State, b: ItemUIButton) {
 fn p_in_rect(p: Vector2, r: Rectangle): bool {
     return (p.x >= r.x && p.x <= (r.x + r.w)) && (p.y >= r.y && p.y <= (r.y + r.h));
 }
+sounds := [5]Sound{ };
 fn main() {
-    SetTraceLogLevel(LOG_WARNING);
+    // SetTraceLogLevel(LOG_WARNING);
     s := new_state();
     if s == 0 {
         println("Failed to init state.");
@@ -284,6 +246,14 @@ fn main() {
     id := -1;
     buffer_read(&initb, &id);
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, clone_cstring("Hello, Raylib!", allocator));
+    InitAudioDevice();
+    sounds = [5]Sound{
+        LoadSound(clone_cstring("assets/duck1.mp3", allocator)),
+        LoadSound(clone_cstring("assets/duck2.mp3", allocator)),
+        LoadSound(clone_cstring("assets/duck3.mp3", allocator)),
+        LoadSound(clone_cstring("assets/duck4.mp3", allocator)),
+        LoadSound(clone_cstring("assets/duck5.mp3", allocator)),
+    };
     SetTargetFPS(60);
     rs := thread_spawn(receiver_loop, s);
 
@@ -320,15 +290,20 @@ fn main() {
     // input -> update state -> draw
     // input is based on previous state
     while !WindowShouldClose() && s^.on {
-        // find self first
+        // find self first and copy entities over
         i := 0;
-        while i < s^.entity_count {
-            e := s^.entities[i];
-            if e.id == id { self = e; break; }
+        while i < s^.secount {
+            e := s^.server_entities[i];
+            s^.entities[i] = s^.server_entities[i];
+            if e.id == id { self = e;}
             i+=1;
         }
+        s^.ecount = s^.secount;
+
         s^.log_builder = sb_make(arena_allocator(&s^.log_arena));
         slog(s, id);
+        slog(s, s^.ecount, "client entities");
+        slog(s, s^.secount, "server entities");
         slog(s, self.pos.x, self.pos.y);
         v = { 0, 0 };
 
@@ -379,17 +354,20 @@ fn main() {
         i = 0;
         a := arena_allocator(&s^.frame_arena);
         itemc: f32 = 0;
-        while i < s^.entity_count {
+        while i < s^.ecount {
             e := s^.entities[i];
             if e.id == self.id {  i += 1; continue; }
             if Vector2Length(Vector2Subtract(self.pos, e.pos)) < 1 {
                 slog(s, "Talk to", e.id);
                 f := fn(v: rawptr, event: UIEvent){
-                    data := cast(^struct { id: int })v;
-                    println("talking to", data^.id);
+                    data := cast(^struct { id: int, sounds: []Sound, })v;
+                    i := GetRandomValue(0, len(sounds) - 1);
+                    println("talking to", data^.id, i);
+                    PlaySound(sounds[i]);
                 };
-                data := new::<struct { id: int }>(a);
+                data := new::<struct { id: int, sounds: []Sound, }>(a);
                 data^.id = e.id;
+                data^.sounds = sounds[:];
                 add_ui_button(s, {{SCREEN_WIDTH/2 + 80, SCREEN_HEIGHT/2 + 50 * itemc},
                                 tprint(a, "Talk to", e.id), f, cast(rawptr)data});
                 itemc += 1;
@@ -449,9 +427,9 @@ fn main() {
         // game itself
         BeginMode3D(camera);
         DrawGrid(20, 1.0);
-        // only first "entity_count" entities are relevant
+        // only first "ecount" entities are relevant
         i = 0;
-        while i < s^.entity_count {
+        while i < s^.ecount {
             e := s^.entities[i];
             model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* e.d));
             DrawModel(model, {-e.pos.x, 0, e.pos.y}, scale, {255, 255, 255, 255});
@@ -476,6 +454,10 @@ fn main() {
     }
     s^.on = false;
     thread_join(rs);
+
+    for sound in sounds {
+        UnloadSound(sound);
+    }
     UnloadModel(model);
     kill_state(s);
     CloseWindow();
@@ -483,7 +465,6 @@ fn main() {
 
 fn kill_state(s: ^State) {
     mutex_destroy(&s^.state_mutex);
-    del_slice(s^.entities, heap_allocator());
     tcp_shutdown(s^.server_conn, SHUT_RDWR);
     tcp_close(s^.server_conn);
     mutex_destroy(&s^.state_mutex);
