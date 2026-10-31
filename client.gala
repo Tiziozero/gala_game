@@ -18,10 +18,15 @@ I := Matrix { [16]f32{
     }
 };
 
-// terrain is drawn at {TERRAIN_O, 0, TERRAIN_O}; mesh verts assumed on 0..255 integer grid
-TERRAIN_O :: -127.5;
+// terrain is drawn at {TERRAIN_OFFSET, 0, TERRAIN_OFFSET}; mesh verts assumed on 0..255 integer grid
+TERRAIN_OFFSET :: -127.5;
 HM_N :: 256;
 heights := [256*256]f32{};
+
+// ---- shadow map settings ----
+SHADOW_RES       :: 2048;
+SHADOW_VIEW_SIZE :: 8.0;  // world units covered by the shadow map (square)
+SHADOW_SLOT      :: 10;    // texture slot, kept away from raylib's material slots
 
 UI_BUTTON :: 1;
 struct UIItem {
@@ -150,8 +155,8 @@ fn build_heights(m: Mesh) {
 
 // ground height at world (x, z), bilinear
 fn terrain_height(wx: f32, wz: f32): f32 {
-    x := wx - TERRAIN_O;
-    z := wz - TERRAIN_O;
+    x := wx - TERRAIN_OFFSET;
+    z := wz - TERRAIN_OFFSET;
     limit: f32 = cast(f32)(HM_N - 1);
     if x < 0 || z < 0 || x >= limit || z >= limit {
         return 0;
@@ -197,8 +202,8 @@ fn mouse_to_ground(camera: Camera3D): Vector2 {
     // you draw things at {-x, 0, y}, so undo that mapping
     return { -hx, hz };
 }
-SCREEN_WIDTH :: 800;
-SCREEN_HEIGHT :: 500;
+SCREEN_WIDTH :: 1280;
+SCREEN_HEIGHT :: 720;
 
 
 struct UIButton {
@@ -302,6 +307,65 @@ fn load_client_model(s: string, scale: f32, allocator: Allocator): ClientModel {
     return {s, m, scale};
 }
 
+// framebuffer with ONLY a depth texture (no color attachment)
+fn load_shadow_map(w: i32, h: i32): RenderTexture2D {
+    rt := RenderTexture { 0, { 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0 } };
+
+    rt.id = rlLoadFramebuffer();   // raylib 5.0: rlLoadFramebuffer(w, h)
+    if rt.id == 0 {
+        println("failed to create shadow framebuffer");
+        return rt;
+    }
+    rlEnableFramebuffer(rt.id);
+
+    rt.depth.id = rlLoadTextureDepth(w, h, false);   // false = texture, not renderbuffer
+    rt.depth.width = w;
+    rt.depth.height = h;
+    rt.depth.mipmaps = 1;
+    // RL_ATTACHMENT_DEPTH = 100, RL_ATTACHMENT_TEXTURE2D = 100
+    rlFramebufferAttach(rt.id, rt.depth.id, 100, 100, 0);
+
+    // BeginTextureMode reads these for the viewport size
+    rt.texture.width = w;
+    rt.texture.height = h;
+
+    if !rlFramebufferComplete(rt.id) {
+        println("shadow framebuffer incomplete");
+    }
+    rlDisableFramebuffer();
+    return rt;
+}
+
+// draws everything that exists in the world. used for BOTH the depth pass and the real pass.
+// shadow_pass = true -> skip debug stuff, terrain uses the plain depth shader
+fn draw_scene(s: ^State, terrain: ^ClientModel, house, house2: ^ClientModel, models: []ClientModel,
+              terrain_shader: Shader, shadow_pass: bool) {
+    terrain^.model.materials[0].shader = terrain_shader;
+    DrawModel(terrain^.model, {TERRAIN_OFFSET, 0, TERRAIN_OFFSET}, 1, {40, 120, 40, 255});
+
+    // only first "ecount" entities are relevant
+    i := 0;
+    while i < s^.ecount {
+        e := s^.entities[i];
+        gy := terrain_height(-e.pos.x, e.pos.y);
+        model := models[e.id%2].model;
+        scale := models[e.id%2].scale;
+        model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* e.d));
+        DrawModel(model, {-e.pos.x, gy, e.pos.y}, scale, {255, 255, 255, 255});
+        if !shadow_pass {
+            DrawCircle3D({-e.pos.x, gy, e.pos.y}, 0.15, {1, 0, 0}, 90, {255,0,0,255});
+            DrawBoundingBox({{-e.pos.x -0.5, gy, e.pos.y -0.5},{-e.pos.x +0.5, gy + 1, e.pos.y +0.5}}, {0, 0, 255, 255});
+        }
+        i += 1;
+    }
+    // house
+    hy := terrain_height(0, 0);
+    // DrawModel(house^.model, {0, hy + 1, 0}, 1, {255, 255, 255, 255});
+    DrawModel(house2^.model, {0, hy + 1 + 2, 0}, 1, {255, 255, 255, 255});
+    DrawCircle3D({0, hy + 1 + 2, 0}, 0.15, {1, 0, 0}, 90, {255,0,0,255});
+}
+
+LIMIT :: 100;
 fn main() {
     // SetTraceLogLevel(LOG_WARNING);
     s := new_state();
@@ -321,6 +385,8 @@ fn main() {
     initb := buffer_wrap(initmsgrecv[:initn]);
     id := -1;
     buffer_read(&initb, &id);
+    // raylib keeps the title pointer, so this one lives in init_arena
+    SetConfigFlags(FLAG_MSAA_4X_HINT);
     // raylib keeps the title pointer, so this one lives in init_arena
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, clone_cstring("Hello, Raylib!", allocator));
     InitAudioDevice();
@@ -366,7 +432,13 @@ fn main() {
     shader.locs[SHADER_LOC_MATRIX_MODEL]  = GetShaderLocation(shader, clone_cstring("matModel", fa));
     shader.locs[SHADER_LOC_MATRIX_NORMAL] = GetShaderLocation(shader, clone_cstring("matNormal", fa));
     terrain.model.materials[0].shader = shader;
-    light_dir   := Vector3 { -0.4, -1.0, -0.3 };
+
+    // raylib's default shader, used for the depth-only pass
+    depth_shader := LoadShader(0, 0);
+    shadow_map := load_shadow_map(SHADOW_RES, SHADOW_RES);
+
+    // normalized version of {-0.4, -1.0, -0.3} (the light camera position is computed from this)
+    light_dir   := Vector3 { -0.357771, -0.894427, -0.268328 };
     light_color := Vector3 { 1.0, 0.95, 0.85 };
     ambient     := Vector3 { 0.25, 0.28, 0.35 };
     fog_color   := Vector3 { 0, 0, 0 };   // same as your ClearBackground
@@ -378,6 +450,8 @@ fn main() {
     loc_view_pos    := GetShaderLocation(shader, clone_cstring("viewPos", fa));
     loc_fog_color   := GetShaderLocation(shader, clone_cstring("fogColor", fa));
     loc_fog_dist    := GetShaderLocation(shader, clone_cstring("fogDist", fa));
+    loc_light_vp    := GetShaderLocation(shader, clone_cstring("lightVP", fa));
+    loc_shadow_map  := GetShaderLocation(shader, clone_cstring("shadowMap", fa));
 
     // init temp strings are done with
     arena_reset(&s^.frame_arena);
@@ -386,6 +460,7 @@ fn main() {
     zoom: f32 = 5;
     self := empty_entity();
     house := load_client_model("assets/house.glb", 50, allocator);
+    house2 := load_client_model("assets/house3.glb", 1, allocator);
     // input -> update state -> draw
     // input is based on previous state
     while !WindowShouldClose() && s^.on {
@@ -504,7 +579,7 @@ fn main() {
                 if mw > 0 { zoom += 0.1; }
                 if mw < 0 { zoom -= 0.1; }
                 if zoom < 2 { zoom = 2; }
-                if zoom > 10 { zoom = 10; }
+                if zoom > LIMIT { zoom = LIMIT; }
             }
 
             if e.kind == UI_EVENT_MOUSE_DOWN && e.event.mouse_down.button == MOUSE_BUTTON_RIGHT {
@@ -516,37 +591,70 @@ fn main() {
             }
         }
 
-        // ===== DRAW =====
+        fgy := terrain_height(-self.pos.x, self.pos.y);
+        p := Vector3{-self.pos.x, fgy, self.pos.y  };
+
+        // ===== PASS 1: depth from the sun =====
+        // the shadow map follows the player
+
+        view := zoom * 3.5;
+        if view < 16 { view = 16; }
+        if view > 64 { view = 64; }
+        light_cam := Camera3D {
+            position = {
+                p.x - light_dir.x * 60,
+                p.y - light_dir.y * 60,
+                p.z - light_dir.z * 60,
+            },
+            target = p,
+            up = {0.0, 1.0, 0.0},
+            fovy = view,   // for orthographic, fovy = view height in world units
+            projection = 1,            // CAMERA_ORTHOGRAPHIC
+        };
+
+        // tight clip range = good depth precision, which makes the bias in the shader meaningful
+        old_near := rlGetCullDistanceNear();
+        old_far  := rlGetCullDistanceFar();
+        rlSetClipPlanes(1.0, 150.0);
+
+        BeginTextureMode(shadow_map);
+        ClearBackground({255, 255, 255, 255});
+        BeginMode3D(light_cam);
+        light_view := rlGetMatrixModelview();
+        light_proj := rlGetMatrixProjection();
+        draw_scene(s, &terrain, &house, &house2, models[:], depth_shader, true);
+        EndMode3D();
+        EndTextureMode();
+
+        rlSetClipPlanes(old_near, old_far);
+        light_vp := MatrixMultiply(light_view, light_proj);
+
+        // ===== PASS 2: normal render =====
         SetShaderValue(shader, loc_light_dir,   cast(rawptr)&light_dir,        SHADER_UNIFORM_VEC3);
         SetShaderValue(shader, loc_light_color, cast(rawptr)&light_color,      SHADER_UNIFORM_VEC3);
         SetShaderValue(shader, loc_ambient,     cast(rawptr)&ambient,          SHADER_UNIFORM_VEC3);
-        SetShaderValue(shader, loc_view_pos,    cast(rawptr)&camera.position,  SHADER_UNIFORM_VEC3);
+        // SetShaderValue(shader, loc_view_pos,    cast(rawptr)&camera.position,  SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, loc_view_pos,    cast(rawptr)&p,  SHADER_UNIFORM_VEC3);
         SetShaderValue(shader, loc_fog_color,   cast(rawptr)&fog_color,        SHADER_UNIFORM_VEC3);
         SetShaderValue(shader, loc_fog_dist,    cast(rawptr)&fog_dist,         SHADER_UNIFORM_FLOAT);
-
+        SetShaderValueMatrix(shader, loc_light_vp, light_vp);
 
         BeginDrawing();
         ClearBackground({0,0,0,255});
+
+        // bind the shadow map to its slot and tell the shader which slot to read
+        rlActiveTextureSlot(SHADOW_SLOT);
+        rlEnableTexture(shadow_map.depth.id);
+        slot: i32 = SHADOW_SLOT;
+        SetShaderValue(shader, loc_shadow_map, cast(rawptr)&slot, SHADER_UNIFORM_INT);
+
         // game itself
         BeginMode3D(camera);
         DrawGrid(20, 1.0);
-        DrawModel(terrain.model, {TERRAIN_O, 0, TERRAIN_O}, 1, {40, 120, 40, 255});
-        // only first "ecount" entities are relevant
-        i = 0;
-        while i < s^.ecount {
-            e := s^.entities[i];
-            gy := terrain_height(-e.pos.x, e.pos.y);
-            model := models[e.id%2].model;
-            scale := models[e.id%2].scale;
-            model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* e.d));
-            DrawModel(model, {-e.pos.x, gy, e.pos.y}, scale, {255, 255, 255, 255});
-            DrawCircle3D({-e.pos.x, gy, e.pos.y}, 0.15, {1, 0, 0}, 90, {255,0,0,255});
-            DrawBoundingBox({{-e.pos.x -0.5, gy, e.pos.y -0.5},{-e.pos.x +0.5, gy + 1, e.pos.y +0.5}}, {0, 0, 255, 255});
-            i += 1;
-        }
-        gy := terrain_height(0, 0);
-        DrawModel(house.model, {0, gy + 1,0}, 1, {255, 255, 255, 255});
+        draw_scene(s, &terrain, &house, &house2, models[:], shader, false);
         EndMode3D();
+        rlActiveTextureSlot(0);
+
         s^.log_builder = sb_make(arena_allocator(&s^.log_arena));
         slog(s, id);
         slog(s, s^.ecount, "client entities");

@@ -2,6 +2,7 @@ import "core/core.gala";
 import "core/mem.gala";
 import "core/cfunctions.gala";
 import "core/rl.gala";
+import "./noise.gala";
 
 SIZE := 255;
 
@@ -12,10 +13,12 @@ colors    := [255*255*4]u8{};
 texcoords := [255*255*2]f32{};
 indices   := [254*254*6]u16{};
 
+// fn fbm(x: f32, y: f32, scale: f32, octaves: int, lacunarity: f32, gain: f32): f32 {
 fn gen_poin_at(x, y: f32): f32 {
-    p : f32 = 1;
-    p *= sinf(x * 0.05);
-    p *= sinf(y * 0.05);
+    i := fbm01(x, y, 0.02, 8, 0.1, 1);
+    p : f32 = i;
+    // p *= sinf(x * 0.05);
+    // p *= sinf(y * 0.05);
     return p;
 }
 
@@ -158,6 +161,7 @@ fn gen_colors() {
 }
 
 fn main() {
+    perlin_seed(1023);
     InitWindow(1280, 720, clone_cstring("Hello, World"));
     SetTargetFPS(60);
 
@@ -171,16 +175,13 @@ fn main() {
         }
         y += 1;
     }
-    foreach(world[:], fn(i: f32): f32 { return i / 10; });
     normalise(world[:]);
 
     // mesh data
     gen_vertices();
     gen_faces();
     gen_colors();
-    foreach(world[:], fn(i: f32): f32 { return i / 10; });
-    gen_vertices();
-    gen_faces();
+    // foreach(world[:], fn(i: f32): f32 { return i / 10; });
     gen_texcoords();
 
     mesh := Mesh{

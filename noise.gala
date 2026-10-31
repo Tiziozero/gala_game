@@ -1,0 +1,99 @@
+import "core/core.gala";
+perm := [512]i32{};
+
+fn perlin_seed(seed: int) {
+    p := [256]i32{};
+    i := 0;
+    while i < 256 {
+        p[i] = cast(i32)i;
+        i += 1;
+    }
+
+    // shuffle with a simple LCG so the same seed gives the same noise
+    state := seed + 12345;
+    i = 255;
+    while i > 0 {
+        state = (state * 1103515245 + 12345) & 2147483647;
+        j := (state >> 16) % (i + 1);
+        tmp := p[i];
+        p[i] = p[j];
+        p[j] = tmp;
+        i -= 1;
+    }
+
+    // doubled so lookups never need wrapping
+    i = 0;
+    while i < 512 {
+        perm[i] = p[i & 255];
+        i += 1;
+    }
+}
+
+fn fade(t: f32): f32 {
+    return t * t * t * (t * (t * 6 - 15) + 10);
+}
+
+fn lerpf(a: f32, b: f32, t: f32): f32 {
+    return a + (b - a) * t;
+}
+
+// 4 diagonal gradients, output stays within -1..1
+fn grad(h: i32, x: f32, y: f32): f32 {
+    g := h & 3;
+    if g == 0 { return  x + y; }
+    if g == 1 { return -x + y; }
+    if g == 2 { return  x - y; }
+    return -x - y;
+}
+
+// single octave, returns roughly -1..1
+fn perlin2(x: f32, y: f32): f32 {
+    xi := cast(int)x;
+    if cast(f32)xi > x { xi -= 1; }   // floor for negatives
+    yi := cast(int)y;
+    if cast(f32)yi > y { yi -= 1; }
+
+    xf := x - cast(f32)xi;
+    yf := y - cast(f32)yi;
+    X := xi & 255;
+    Y := yi & 255;
+
+    u := fade(xf);
+    v := fade(yf);
+
+    aa := perm[cast(int)perm[X] + Y];
+    ab := perm[cast(int)perm[X] + Y + 1];
+    ba := perm[cast(int)perm[X + 1] + Y];
+    bb := perm[cast(int)perm[X + 1] + Y + 1];
+
+    x1 := lerpf(grad(aa, xf,     yf),     grad(ba, xf - 1, yf),     u);
+    x2 := lerpf(grad(ab, xf,     yf - 1), grad(bb, xf - 1, yf - 1), u);
+    return lerpf(x1, x2, v);
+}
+
+// fractal noise: sums octaves, normalized to -1..1
+//   scale:      world units -> noise units (smaller = bigger features)
+//   octaves:    layers of detail
+//   lacunarity: frequency multiplier per octave (usually 2)
+//   gain:       amplitude multiplier per octave (usually 0.5)
+fn fbm(x: f32, y: f32, scale: f32, octaves: int, lacunarity: f32, gain: f32): f32 {
+    total: f32 = 0;
+    amp: f32 = 1;
+    freq: f32 = scale;
+    norm: f32 = 0;
+
+    o := 0;
+    while o < octaves {
+        total += perlin2(x * freq, y * freq) * amp;
+        norm += amp;
+        amp *= gain;
+        freq *= lacunarity;
+        o += 1;
+    }
+    return total / norm;
+}
+
+// convenience: 0..1 range
+fn fbm01(x: f32, y: f32, scale: f32, octaves: int, lacunarity: f32, gain: f32): f32 {
+    return fbm(x, y, scale, octaves, lacunarity, gain) * 0.5 + 0.5;
+}
