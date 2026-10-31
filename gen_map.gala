@@ -1,0 +1,242 @@
+import "core/core.gala";
+import "core/mem.gala";
+import "core/cfunctions.gala";
+import "core/rl.gala";
+
+SIZE := 255;
+
+world     := [255*255]f32{};
+vertices  := [255*255]Vector3{};
+normals   := [255*255]Vector3{};
+colors    := [255*255*4]u8{};
+texcoords := [255*255*2]f32{};
+indices   := [254*254*6]u16{};
+
+fn gen_poin_at(x, y: f32): f32 {
+    p : f32 = 1;
+    p *= sinf(x * 0.05);
+    p *= sinf(y * 0.05);
+    return p;
+}
+
+fn foreach(data: []$T, f: fn(i: T): T) {
+    i := 0;
+    while i < len(data) {
+        data[i] = f(data[i]);
+        i += 1;
+    }
+}
+
+fn normalise(data: []$T) {
+    i := 0;
+    m: T = 0;
+    while i < len(data) {
+        if data[i] > m { m = data[i]; }
+        i += 1;
+    }
+    if m == 0 { return; }
+    i = 0;
+    while i < len(data) {
+        data[i] = data[i] / m;
+        i += 1;
+    }
+}
+
+fn cross(a, b: Vector3): Vector3 {
+    return {
+        a.y*b.z - a.z*b.y,
+        a.z*b.x - a.x*b.z,
+        a.x*b.y - a.y*b.x,
+    };
+}
+
+fn dot3(a, b: Vector3): f32 {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+
+fn clamp01(v: f32): f32 {
+    if v < 0 { return 0; }
+    if v > 1 { return 1; }
+    return v;
+}
+
+fn gen_vertices() {
+    y := 0;
+    while y < 255 {
+        x := 0;
+        while x < 255 {
+            i := y * 255 + x;
+            vertices[i] = Vector3{
+                cast(f32)x,
+                world[i] * 30,
+                cast(f32)y,
+            };
+            x += 1;
+        }
+        y += 1;
+    }
+}
+
+// quad: v0 v1 / v2 v3, triangles: (v0 v2 v1) and (v1 v2 v3)
+fn gen_faces() {
+
+    i := 0;
+    y := 0;
+    while y < 254 {
+        x := 0;
+        while x < 254 {
+            v0 := y * 255 + x;
+            v1 := v0 + 1;
+            v2 := v0 + 255;
+            v3 := v2 + 1;
+
+            indices[i]   = cast(u16)v0;
+            indices[i+1] = cast(u16)v2;
+            indices[i+2] = cast(u16)v1;
+
+            n1 := cross(
+                Vector3Subtract(vertices[v2],vertices[v0]),
+                Vector3Subtract(vertices[v1], vertices[v0])
+            );
+            normals[v0] = Vector3Add(normals[v0], n1);
+            normals[v2] = Vector3Add(normals[v2], n1);
+            normals[v1] = Vector3Add(normals[v1], n1);
+
+            indices[i+3] = cast(u16)v1;
+            indices[i+4] = cast(u16)v2;
+            indices[i+5] = cast(u16)v3;
+
+            n2 := cross(
+                Vector3Subtract(vertices[v2], vertices[v1]),
+                Vector3Subtract(vertices[v3], vertices[v1])
+            );
+            normals[v1] = Vector3Add(normals[v1], n2);
+            normals[v2] = Vector3Add(normals[v2], n2);
+            normals[v3] = Vector3Add(normals[v3], n2);
+
+            i += 6;
+            x += 1;
+        }
+        y += 1;
+    }
+
+    i = 0;
+    while i < 255*255 {
+        normals[i] = Vector3Normalize(normals[i]);
+        i += 1;
+    }
+}
+
+// uv in 0..1 across the grid; ExportMesh (obj) reads these
+fn gen_texcoords() {
+    i := 0;
+    while i < 255*255 {
+        texcoords[i*2]     = cast(f32)(i % 255) / 254;
+        texcoords[i*2 + 1] = cast(f32)(i / 255) / 254;
+        i += 1;
+    }
+}
+
+// raylib's default shader has no lighting, so bake it into vertex colors
+fn gen_colors() {
+    light := Vector3Normalize(Vector3{0.4, 1.0, 0.3});
+    i := 0;
+    while i < 255*255 {
+        t : f32 = clamp01((world[i] + 1) * 0.5);
+        l : f32 = 0.3 + 0.7 * clamp01(dot3(normals[i], light));
+
+        r : f32 = (60 + 170 * t) * l;
+        g : f32 = (120 + 90 * t) * l;
+        b : f32 = (60 + 150 * t * t) * l;
+
+        colors[i*4]     = cast(u8)r;
+        colors[i*4 + 1] = cast(u8)g;
+        colors[i*4 + 2] = cast(u8)b;
+        colors[i*4 + 3] = 255;
+        i += 1;
+    }
+}
+
+fn main() {
+    InitWindow(1280, 720, clone_cstring("Hello, World"));
+    SetTargetFPS(60);
+
+    // heightmap
+    y : i32 = 0;
+    while y < 255 {
+        x : i32 = 0;
+        while x < 255 {
+            world[y*255 + x] = gen_poin_at(cast(f32)x, cast(f32)y);
+            x += 1;
+        }
+        y += 1;
+    }
+    foreach(world[:], fn(i: f32): f32 { return i / 10; });
+    normalise(world[:]);
+
+    // mesh data
+    gen_vertices();
+    gen_faces();
+    gen_colors();
+    foreach(world[:], fn(i: f32): f32 { return i / 10; });
+    gen_vertices();
+    gen_faces();
+    gen_texcoords();
+
+    mesh := Mesh{
+        vertexCount   = 255*255,
+        triangleCount = 254*254*2,
+
+        vertices   = cast(^f32)&vertices[0],
+        texcoords  = &texcoords[0],
+        texcoords2 = 0,
+        normals    = cast(^f32)&normals[0],
+        tangents   = 0,
+        colors     = &colors[0],
+        indices    = &indices[0],
+
+        boneCount   = 0,
+        boneIndices = 0,
+        boneWeights = 0,
+
+        animVertices = 0,
+        animNormals  = 0,
+
+        vaoId = 0,
+        vboId = 0,
+    };
+    UploadMesh(&mesh, false);
+    model := LoadModelFromMesh(mesh);
+
+    if !ExportMesh(mesh, clone_cstring("terrain.obj")) {
+        println("export failed");
+    }
+
+    camera := Camera3D{
+        position   = Vector3{340, 180, 340},
+        target     = Vector3{127, 0, 127},
+        up         = Vector3{0, 1, 0},
+        fovy       = 60,
+        projection = 0,
+    };
+
+    // raylib 5: CAMERA_FREE = 1, CAMERA_ORBITAL = 2
+    camera_mode : i32 = 2;
+
+    while !WindowShouldClose() {
+        UpdateCamera(&camera, camera_mode);
+
+        BeginDrawing();
+        ClearBackground({20, 24, 32, 255});
+
+        BeginMode3D(camera);
+        DrawModel(model, Vector3{0, 0, 0}, 1, {255, 255, 255, 255});
+        EndMode3D();
+
+        DrawFPS(10, 10);
+        EndDrawing();
+    }
+
+    // no UnloadModel: raylib would free() our static arrays
+    CloseWindow();
+}

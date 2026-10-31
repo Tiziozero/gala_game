@@ -18,6 +18,11 @@ I := Matrix { [16]f32{
     }
 };
 
+// terrain is drawn at {TERRAIN_O, 0, TERRAIN_O}; mesh verts assumed on 0..255 integer grid
+TERRAIN_O :: -127.5;
+HM_N :: 256;
+heights := [256*256]f32{};
+
 UI_BUTTON :: 1;
 struct UIItem {
     kind: int,
@@ -126,6 +131,46 @@ fn slog(s: ^State, data: ..any) {
     s^.log_index += 1;
     sb_clear(&s^.log_builder);
 }
+
+// copy mesh vertex heights into the grid
+fn build_heights(m: Mesh) {
+    i := 0;
+    while i < cast(i64)m.vertexCount {
+        vx := m.vertices[i*3];
+        vy := m.vertices[i*3 + 1];
+        vz := m.vertices[i*3 + 2];
+        ix := cast(int)(vx + 0.5);
+        iz := cast(int)(vz + 0.5);
+        if ix >= 0 && ix < HM_N && iz >= 0 && iz < HM_N {
+            heights[iz*HM_N + ix] = vy;
+        }
+        i += 1;
+    }
+}
+
+// ground height at world (x, z), bilinear
+fn terrain_height(wx: f32, wz: f32): f32 {
+    x := wx - TERRAIN_O;
+    z := wz - TERRAIN_O;
+    limit: f32 = cast(f32)(HM_N - 1);
+    if x < 0 || z < 0 || x >= limit || z >= limit {
+        return 0;
+    }
+    ix := cast(int)x;
+    iz := cast(int)z;
+    fx := x - cast(f32)ix;
+    fz := z - cast(f32)iz;
+
+    h00 := heights[iz*HM_N + ix];
+    h10 := heights[iz*HM_N + ix + 1];
+    h01 := heights[(iz + 1)*HM_N + ix];
+    h11 := heights[(iz + 1)*HM_N + ix + 1];
+
+    a := h00 + (h10 - h00) * fx;
+    b := h01 + (h11 - h01) * fx;
+    return a + (b - a) * fz;
+}
+
 fn mouse_to_ground(camera: Camera3D): Vector2 {
     ray := GetScreenToWorldRay(GetMousePosition(), camera);
 
@@ -133,13 +178,21 @@ fn mouse_to_ground(camera: Camera3D): Vector2 {
         return {0, 0};
     }
 
-    t := -ray.position.y / ray.direction.y;
-    if t < 0 {
-        return {0, 0};
+    // intersect plane y=h, then re-sample the terrain height there and repeat
+    h: f32 = 0;
+    hx: f32 = 0;
+    hz: f32 = 0;
+    iter := 0;
+    while iter < 4 {
+        t := (h - ray.position.y) / ray.direction.y;
+        if t < 0 {
+            return {0, 0};
+        }
+        hx = ray.position.x + t * ray.direction.x;
+        hz = ray.position.z + t * ray.direction.z;
+        h = terrain_height(hx, hz);
+        iter += 1;
     }
-
-    hx := ray.position.x + t * ray.direction.x;
-    hz := ray.position.z + t * ray.direction.z;
 
     // you draw things at {-x, 0, y}, so undo that mapping
     return { -hx, hz };
@@ -237,6 +290,18 @@ fn send_fuckass_interact_request(s: ^State, target: int) {
     pack_message({ kind = MK_UPDATE, data = { update = { UPDATE_INTERACT_ENTITY, { interact = target } } } },&b,  );
     tcp_send(s^.server_conn, buffer_slice(&b));
 }
+
+struct ClientModel {
+    path: string,
+    model: Model,
+    scale: f32,
+}
+
+fn load_client_model(s: string, scale: f32, allocator: Allocator): ClientModel {
+    m := LoadModel(clone_cstring(s, allocator));
+    return {s, m, scale};
+}
+
 fn main() {
     // SetTraceLogLevel(LOG_WARNING);
     s := new_state();
@@ -245,27 +310,35 @@ fn main() {
         return;
     }
     allocator := arena_allocator(&s^.init_arena);
+
+    // arenas first, so init code can use the frame arena for temp strings
+    s^.frame_arena  = arena_make(1024*1024); // 1MB
+    s^.log_arena    = arena_make(1024*1024); // 1MB
+    fa := arena_allocator(&s^.frame_arena);
+
     initmsgrecv:=[1024]byte{};
     initn := tcp_recv(s^.server_conn, initmsgrecv[:]);
     initb := buffer_wrap(initmsgrecv[:initn]);
     id := -1;
     buffer_read(&initb, &id);
+    // raylib keeps the title pointer, so this one lives in init_arena
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, clone_cstring("Hello, Raylib!", allocator));
     InitAudioDevice();
+
     sounds = [5]Sound{
-        LoadSound(clone_cstring("assets/duck1_2.mp3", allocator)),
-        LoadSound(clone_cstring("assets/duck2_2.mp3", allocator)),
-        LoadSound(clone_cstring("assets/duck3_2.mp3", allocator)),
-        LoadSound(clone_cstring("assets/duck4_2.mp3", allocator)),
-        LoadSound(clone_cstring("assets/duck5_2.mp3", allocator)),
+        LoadSound(clone_cstring("assets/duck1_2.mp3", fa)),
+        LoadSound(clone_cstring("assets/duck2_2.mp3", fa)),
+        LoadSound(clone_cstring("assets/duck3_2.mp3", fa)),
+        LoadSound(clone_cstring("assets/duck4_2.mp3", fa)),
+        LoadSound(clone_cstring("assets/duck5_2.mp3", fa)),
+    };
+    models := [10]ClientModel{
+        load_client_model("assets/B3.glb", 0.3, fa),
+        load_client_model("duck.obj", 1,  fa),
     };
     SetTargetFPS(60);
     rs := thread_spawn(receiver_loop, s);
 
-    model_path := "./duck.obj";
-    scale : f32 = 1.5;
-
-    model := LoadModel(clone_cstring(model_path, allocator));
     camera := Camera3D {
         position = { 5.0, 4.0, 5.0 },
         target = { 0.0, 0.0, 0.0 },
@@ -273,7 +346,6 @@ fn main() {
         fovy = 45.0,
         projection = 0, // "CAMERA_PERSPECTIVE" in reaylib header is 0
     };
-    println("loaded", model_path);
 
     v := Vector2 { 0, 0 };
     last_d := v;
@@ -283,15 +355,37 @@ fn main() {
             sinf(35*PI/180),
             -sinf(45*PI/180) * cosf(35*PI/180),
     };
+
     sendb := [1024]byte{};
     bf := buffer_wrap(sendb[:]);
     buffer_clear(&bf);
-    s^.frame_arena  = arena_make(1024*1024); // 1MB
-    s^.log_arena    = arena_make(1024*1024); // 1MB
+
+    terrain := load_client_model("terrain.obj", 1, fa);
+    build_heights(terrain.model.meshes[0]);
+    shader := LoadShader(clone_cstring("terrain.vs", fa), clone_cstring("terrain.fs", fa));
+    shader.locs[SHADER_LOC_MATRIX_MODEL]  = GetShaderLocation(shader, clone_cstring("matModel", fa));
+    shader.locs[SHADER_LOC_MATRIX_NORMAL] = GetShaderLocation(shader, clone_cstring("matNormal", fa));
+    terrain.model.materials[0].shader = shader;
+    light_dir   := Vector3 { -0.4, -1.0, -0.3 };
+    light_color := Vector3 { 1.0, 0.95, 0.85 };
+    ambient     := Vector3 { 0.25, 0.28, 0.35 };
+    fog_color   := Vector3 { 0, 0, 0 };   // same as your ClearBackground
+    fog_dist    : f32 = 40;
+
+    loc_light_dir   := GetShaderLocation(shader, clone_cstring("lightDir", fa));
+    loc_light_color := GetShaderLocation(shader, clone_cstring("lightColor", fa));
+    loc_ambient     := GetShaderLocation(shader, clone_cstring("ambient", fa));
+    loc_view_pos    := GetShaderLocation(shader, clone_cstring("viewPos", fa));
+    loc_fog_color   := GetShaderLocation(shader, clone_cstring("fogColor", fa));
+    loc_fog_dist    := GetShaderLocation(shader, clone_cstring("fogDist", fa));
+
+    // init temp strings are done with
+    arena_reset(&s^.frame_arena);
 
     frame: f32 = 0;
     zoom: f32 = 5;
     self := empty_entity();
+    house := load_client_model("assets/house.glb", 50, allocator);
     // input -> update state -> draw
     // input is based on previous state
     while !WindowShouldClose() && s^.on {
@@ -304,12 +398,6 @@ fn main() {
             i+=1;
         }
         s^.ecount = s^.secount;
-
-        s^.log_builder = sb_make(arena_allocator(&s^.log_arena));
-        slog(s, id);
-        slog(s, s^.ecount, "client entities");
-        slog(s, s^.secount, "server entities");
-        slog(s, self.pos.x, self.pos.y);
         v = { 0, 0 };
 
         // ===== INPUT =====
@@ -348,12 +436,13 @@ fn main() {
 
 
         // ===== UPDATE =====
-        // target and some bullshit going on here.
+        // camera follows self, including ground height
+        self_y := terrain_height(-self.pos.x, self.pos.y);
         camera.position.x = zoom*camabc.x + -self.pos.x;
-        camera.position.y = zoom*camabc.y;
+        camera.position.y = zoom*camabc.y + self_y;
         camera.position.z = zoom*camabc.z + self.pos.y;
         camera.target.x = -self.pos.x;
-        camera.target.y = 0.5;
+        camera.target.y = self_y + 0.5;
         camera.target.z =  self.pos.y;
         // UI and dialouges
         i = 0;
@@ -428,22 +517,41 @@ fn main() {
         }
 
         // ===== DRAW =====
+        SetShaderValue(shader, loc_light_dir,   cast(rawptr)&light_dir,        SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, loc_light_color, cast(rawptr)&light_color,      SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, loc_ambient,     cast(rawptr)&ambient,          SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, loc_view_pos,    cast(rawptr)&camera.position,  SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, loc_fog_color,   cast(rawptr)&fog_color,        SHADER_UNIFORM_VEC3);
+        SetShaderValue(shader, loc_fog_dist,    cast(rawptr)&fog_dist,         SHADER_UNIFORM_FLOAT);
+
+
         BeginDrawing();
         ClearBackground({0,0,0,255});
         // game itself
         BeginMode3D(camera);
         DrawGrid(20, 1.0);
+        DrawModel(terrain.model, {TERRAIN_O, 0, TERRAIN_O}, 1, {40, 120, 40, 255});
         // only first "ecount" entities are relevant
         i = 0;
         while i < s^.ecount {
             e := s^.entities[i];
+            gy := terrain_height(-e.pos.x, e.pos.y);
+            model := models[e.id%2].model;
+            scale := models[e.id%2].scale;
             model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* e.d));
-            DrawModel(model, {-e.pos.x, 0, e.pos.y}, scale, {255, 255, 255, 255});
-            DrawCircle3D({-e.pos.x, 0, e.pos.y}, 0.15, {1, 0, 0}, 90, {255,0,0,255});
-            DrawBoundingBox({{-e.pos.x -0.5, 0, e.pos.y -0.5},{-e.pos.x +0.5, 1, e.pos.y +0.5}}, {0, 0, 255, 255});
+            DrawModel(model, {-e.pos.x, gy, e.pos.y}, scale, {255, 255, 255, 255});
+            DrawCircle3D({-e.pos.x, gy, e.pos.y}, 0.15, {1, 0, 0}, 90, {255,0,0,255});
+            DrawBoundingBox({{-e.pos.x -0.5, gy, e.pos.y -0.5},{-e.pos.x +0.5, gy + 1, e.pos.y +0.5}}, {0, 0, 255, 255});
             i += 1;
         }
+        gy := terrain_height(0, 0);
+        DrawModel(house.model, {0, gy + 1,0}, 1, {255, 255, 255, 255});
         EndMode3D();
+        s^.log_builder = sb_make(arena_allocator(&s^.log_arena));
+        slog(s, id);
+        slog(s, s^.ecount, "client entities");
+        slog(s, s^.secount, "server entities");
+        slog(s, self.pos.x, self.pos.y);
 
         for item in s^.ui_items[:s^.ui_item_count] {
             if item.kind == UI_BUTTON {
@@ -464,7 +572,9 @@ fn main() {
     for sound in sounds {
         UnloadSound(sound);
     }
-    UnloadModel(model);
+    for m in models[:2] {
+        UnloadModel(m.model);
+    }
     kill_state(s);
     CloseWindow();
 }
