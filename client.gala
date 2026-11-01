@@ -399,7 +399,8 @@ fn main() {
         LoadSound(clone_cstring("assets/duck5_2.mp3", fa)),
     };
     models := [10]ClientModel{
-        load_client_model("assets/B3.glb", 0.3, fa),
+        // load_client_model("assets/B3.glb", 0.3, fa),
+        load_client_model("duck.obj", 1,  fa),
         load_client_model("duck.obj", 1,  fa),
     };
     SetTargetFPS(60);
