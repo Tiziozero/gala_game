@@ -1,11 +1,22 @@
-import "core/rl.gala";
-import "core/net.gala";
-import "core/core.gala";
-import "core/mem.gala";
-import "core/cfunctions.gala";
-import "core/threads.gala";
-import "core/buffer_io.gala";
-import "core/string_builder.gala";
+@if(WINDOWS) {
+    import "core/core_windows.gala";
+    import "core/rl_windows.gala";
+    import "core/net_windows.gala";
+    import "core/cfunctions_windows.gala";
+    import "core/threads_windows.gala";
+    import "core/mem_windows.gala";
+    import "core/string_builder_windows.gala";
+    import "core/buffer_io_windows.gala";
+} else {
+    import "core/core_posix.gala";
+    import "core/rl_posix.gala";
+    import "core/net_posix.gala";
+    import "core/cfunctions_posix.gala";
+    import "core/threads_posix.gala";
+    import "core/mem_posix.gala";
+    import "core/string_builder_posix.gala";
+    import "core/buffer_io_posix.gala";
+}
 import "./common.gala";
 
 

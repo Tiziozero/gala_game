@@ -13,3 +13,9 @@ runc: client
 
 memcheck_client: client
 	LD_LIBRARY_PATH=./lib valgrind ./client --leak-check=full
+
+
+client_windows:
+	..\onin_gala\galac.exe client.gala -o client.exe --abi win64 -l .\lib\raylib.lib -d
+runc_windows: client_windows
+	.\client.exe
