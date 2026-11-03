@@ -16,7 +16,7 @@
     import "core/buffer_io_posix.gala";
 }
 import "./common.gala";
-
+import "core/net_common.gala";
 AI_IDLE   :: 0;
 AI_CHASE  :: 1;
 AI_ATTACK :: 2;
@@ -344,95 +344,118 @@ fn kill_client(s: ^State, c: Client) {
     mutex_lock(&s^.state_mutex);
     remove_client(s, c.id);
     mutex_unlock(&s^.state_mutex);
+
     tcp_shutdown(c.socket, SHUT_RDWR);
     tcp_close(c.socket);
+
     println("closed client:", c.id, c.socket.fd);
 }
 
 // ============================================================
 // Threads
 // ============================================================
-
 struct hc_payload { clients_socket: TcpSocket, s: ^State }
 fn handle_client(payload: ^hc_payload) {
     client_socket := payload^.clients_socket;
     s := payload^.s;
 
-    println("fd:", client_socket.fd);
-
     c := Client{true, -1, client_socket, -1};
     e := make_entity(DEF_PLAYER, EK_PLAYER, {2, 2}, 0);
 
     mutex_lock(&s^.state_mutex);
+
     nc := insert_client(s, c, e);
+
     if nc.r {
         c = s^.clients[nc.id];
+
+        b := buffer_make(64);
+        buffer_write(&b, c.entity_id);
+
+        send_err := tcp_send_all(client_socket, buffer_slice(&b));
+        if !net_ok(send_err) {
+            println("Failed to send initial entity ID:",
+                net_error_message(send_err.kind), send_err.os_code);
+        }
+
+        buffer_destroy(&b);
     }
+
     mutex_unlock(&s^.state_mutex);
 
     if !nc.r {
-        println("Failed to insert client?");
+        println("Failed to insert client.");
+        tcp_close(client_socket);
         free(cast(rawptr)payload);
         return;
     }
-    println("Cliend id:", c.id);
 
-    // send entity id
-    b := buffer_make(64);
-    buffer_write(&b, c.entity_id);
-    // no pipe
-    tcp_send(client_socket, buffer_slice(&b), flags=0x4000);
-    buffer_destroy(&b);
+    println("Client id:", c.id);
 
     rb := [1024]byte{};
     frame_arena := arena_make(1024*16);
+
     while true {
-        n := tcp_recv(c.socket, rb[:]);
-        if n <= 0 {
-            println("revceived {} bytes from client. killing.", n);
+        r := tcp_recv(c.socket, rb[:]);
+
+        if !net_ok(r.err) {
+            println("recv failed:",
+                net_error_message(r.err.kind), r.err.os_code);
             break;
         }
-        bf := buffer_wrap(rb[:n]);
+
+        if r.n == 0 {
+            println("Client disconnected.");
+            break;
+        }
+
+        bf := buffer_wrap(rb[:r.n]);
         m := Message{0, { nufin = 0 }};
-        if !unpack_message(&bf,&m, arena_allocator(&frame_arena)) {
-            v := 0;
-            for i in rb[:n] {
-                println(v, i);
-            }
-            println("failed to unpack message");
+
+        if !unpack_message(&bf, &m, arena_allocator(&frame_arena)) {
+            println("Failed to unpack message.");
             break;
         }
+
         if m.kind == MK_UPDATE {
             uk := m.data.update.kind;
+
             if uk == UPDATE_MOVE_TO {
                 p := m.data.update.data.move_to;
+
                 mutex_lock(&s^.state_mutex);
                 s^.brains[c.entity_id].move_to = p;
                 s^.brains[c.entity_id].moving = true;
                 mutex_unlock(&s^.state_mutex);
+
             } else if uk == UPDATE_INTERACT_ENTITY {
                 target := m.data.update.data.interact;
+
                 mutex_lock(&s^.state_mutex);
                 try_interact(s, c.entity_id, target);
                 mutex_unlock(&s^.state_mutex);
+
             } else {
-                println("Invalid update message kind form user: {} (got {}).", c.id, uk);
+                println("Invalid update kind:", uk);
                 break;
             }
+
         } else {
-            println("Invalid message kind form user: {} (got {}).", c.id, m.kind);
+            println("Invalid message kind:", m.kind);
             break;
         }
+
+        arena_reset(&frame_arena);
     }
 
     mutex_lock(&s^.state_mutex);
     remove_client(s, c.id);
     mutex_unlock(&s^.state_mutex);
 
+    tcp_close(c.socket);
     arena_destroy(&frame_arena);
     free(cast(rawptr)payload);
 }
-
 fn sender_thread(s: ^State) {
     entities := [MAX_ENTITIES]Entity{};
     targets := [MAX_ENTITIES]Client{};
@@ -473,9 +496,11 @@ fn sender_thread(s: ^State) {
         k := 0;
         while k < nt {
             c := targets[k];
-            n := tcp_send(c.socket, bytes_from(b.data, b.length), flags=0x4000);
-            if n != b.length {
-                println("failed to send all bytes to", c.id);
+            send_err := tcp_send_all(c.socket, bytes_from(b.data, b.length));
+
+            if !net_ok(send_err) {
+                println("Failed to send to client:", c.id,
+                    net_error_message(send_err.kind), send_err.os_code);
                 kill_client(s, c);
             }
             k += 1;
@@ -490,15 +515,20 @@ fn spawn(s: ^State, def: int, kind: int, pos: Vector2, flags: int): int {
 }
 
 fn main(): i32 {
-    listener := tcp_listen(1234, 10);
-    if listener.fd < 0 {
-        println("Failed to initialise listener.");
+    listener_result := tcp_listen(1234, 10);
+
+    if !net_ok(listener_result.err) {
+        println("Failed to listen:",
+            net_error_message(listener_result.err.kind),
+            listener_result.err.os_code);
         return -1;
     }
+
+    listener := listener_result.sock;
+
     s := new::<State>();
     mutex_init(&s^.state_mutex);
 
-    // before the sender thread exists, so no lock needed
     spawn(s, DEF_VILLAGER, EK_NPC, {4, 4}, FL_TALKABLE);
     spawn(s, DEF_VILLAGER, EK_NPC, {6, 4}, FL_TALKABLE);
     spawn(s, DEF_SLIME, EK_HOSTILE, {10, 10}, FL_ATTACKABLE);
@@ -507,23 +537,29 @@ fn main(): i32 {
     s^.on = true;
     st := thread_spawn(sender_thread, s);
 
-    while s^.on  {
+    while s^.on {
         println("Accepting connection.");
-        c := tcp_accept(listener);
-        if c.fd < 0 {
-            println("Error in receiving.");
-            println("Ignoring.");
+
+        result := tcp_accept(listener);
+
+        if !net_ok(result.err) {
+            println("Accept failed:",
+                net_error_message(result.err.kind),
+                result.err.os_code);
             continue;
         }
+
         payload := new::<hc_payload>();
-        payload^.clients_socket = c;
+        payload^.clients_socket = result.sock;
         payload^.s = s;
+
         thread_spawn(handle_client, payload);
     }
+
     thread_join(st);
 
-    free(cast(rawptr)s);
-    println("Closing listener.");
     tcp_close(listener);
+    free(cast(rawptr)s);
+
     return 0;
 }

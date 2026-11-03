@@ -17,6 +17,7 @@
     import "core/string_builder_posix.gala";
     import "core/buffer_io_posix.gala";
 }
+import "core/net_common.gala";
 import "./common.gala";
 
 
@@ -65,27 +66,49 @@ struct State {
     on:             bool,
 }
 
+// Sends the whole buffer or stops the client with a printed reason.
+fn send_to_server(s: ^State, data: []byte) {
+    e := tcp_send_all(s^.server_conn, data);
+    if !net_ok(e) {
+        println("send to server failed:", net_error_message(e.kind), e.os_code);
+        s^.on = false;
+    }
+}
+
 // sometimes, receiver would get 1000+ bytes message. claude suggested it's tcp
 // packing multiple fast messages together, so basically batch input and read as needed
 fn receiver_loop(s: ^State) {
     acc := [1024*128]byte{};
     filled := 0;
+
     frame_arena := arena_make(1024*16);
     msg: Message = {0, {nufin=0}};
 
     while s^.on {
-        n := tcp_recv(s^.server_conn, acc[filled:]);
-        if n <= 0 {
-            if n == -1 {
-                println("no data");
+        r := tcp_recv(s^.server_conn, acc[filled:]);
+
+        if !net_ok(r.err) {
+            if net_is_timeout(r.err) {
                 continue;
             }
-            println("Received 0 from server.");
+
+            if s^.on {
+                println("recv failed:",
+                    net_error_message(r.err.kind),
+                    r.err.os_code);
+            }
+
             s^.on = false;
             break;
         }
-        filled += n;
 
+        if r.n == 0 {
+            println("Server closed the connection.");
+            s^.on = false;
+            break;
+        }
+
+        filled += r.n;
         pos := 0;
 
         while pos < filled {
@@ -93,7 +116,7 @@ fn receiver_loop(s: ^State) {
             total := frame_size(&b);
 
             if total < 0 {
-                println("bad frame size");
+                println("Bad frame size.");
                 s^.on = false;
                 break;
             }
@@ -103,38 +126,38 @@ fn receiver_loop(s: ^State) {
             }
 
             if !unpack_message(&b, &msg, arena_allocator(&frame_arena)) {
-                println("failed to unpack message?");
+                println("Failed to unpack message.");
                 s^.on = false;
                 break;
             }
 
             if msg.kind == MK_STATE {
                 i := 0;
+
                 while i < len(msg.data.state.entities) {
                     s^.server_entities[i] = msg.data.state.entities[i];
                     i += 1;
                 }
-                s^.secount = len(msg.data.state.entities);
-            } else {
 
+                s^.secount = len(msg.data.state.entities);
             }
 
             arena_reset(&frame_arena);
             pos += total;
         }
 
-        // move the partial frame (if any) to the front
         rest := filled - pos;
         j := 0;
+
         while j < rest {
             acc[j] = acc[pos + j];
             j += 1;
         }
+
         filled = rest;
     }
 
     arena_destroy(&frame_arena);
-    println("end receiver loop");
 }
 
 fn slog(s: ^State, data: ..any) {
@@ -256,22 +279,25 @@ struct UIEvent {
     },
 }
 fn new_state(): ^State {
-    server_conn := tcp_connect("127.0.0.1", 1234);
-    if server_conn.fd < 0 {
-        println("Failed to init server connection");
+    conn := tcp_connect("127.0.0.1", 1234);
+
+    if !net_ok(conn.err) {
+        println("Failed to connect:",
+            net_error_message(conn.err.kind),
+            conn.err.os_code);
         return 0;
     }
 
-    result := tcp_set_recv_timeout(server_conn, 3, 0);
-    if result < 0 {
-        println("failed to set receive timeout");
-        return 0;
-    }
-    s := new::<State>(); // just heap
-    s^.init_arena = arena_make(1024*1024); // 1MB
-    s^.server_conn = server_conn;
+    s := new::<State>();
+    s^.server_conn = conn.sock;
     s^.on = true;
+
+    s^.init_arena = arena_make(1024*1024);
+    s^.frame_arena = arena_make(1024*1024);
+    s^.log_arena = arena_make(1024*1024);
+
     mutex_init(&s^.state_mutex);
+
     return s;
 }
 fn add_ui_button(s: ^State, b: UIButton) {
@@ -303,8 +329,8 @@ fn send_fuckass_interact_request(s: ^State, target: int) {
     data := [1024]byte{};
     b := buffer_wrap(data[:]);
     buffer_clear(&b);
-    pack_message({ kind = MK_UPDATE, data = { update = { UPDATE_INTERACT_ENTITY, { interact = target } } } },&b,  );
-    tcp_send(s^.server_conn, buffer_slice(&b));
+    pack_message({ kind = MK_UPDATE, data = { update = { UPDATE_INTERACT_ENTITY, { interact = target } } } }, &b);
+    send_to_server(s, buffer_slice(&b));
 }
 
 struct ClientModel {
@@ -391,9 +417,27 @@ fn main() {
     s^.log_arena    = arena_make(1024*1024); // 1MB
     fa := arena_allocator(&s^.frame_arena);
 
-    initmsgrecv:=[1024]byte{};
-    initn := tcp_recv(s^.server_conn, initmsgrecv[:]);
-    initb := buffer_wrap(initmsgrecv[:initn]);
+    initmsgrecv := [1024]byte{};
+
+    initr := tcp_recv(s^.server_conn, initmsgrecv[:]);
+
+    if !net_ok(initr.err) {
+        println("Failed to receive ID:",
+            net_error_message(initr.err.kind),
+            initr.err.os_code);
+
+        kill_state(s);
+        return;
+    }
+
+    if initr.n == 0 {
+        println("Server closed the connection before sending the ID.");
+        kill_state(s);
+        return;
+    }
+
+    initb := buffer_wrap(initmsgrecv[:initr.n]);
+
     id := -1;
     buffer_read(&initb, &id);
     // raylib keeps the title pointer, so this one lives in init_arena
@@ -598,7 +642,7 @@ fn main() {
                 target := mouse_to_ground(camera);
                 buffer_clear(&bf);
                 pack_message({MK_UPDATE, { update = { UPDATE_MOVE_TO, { move_to = target } }  } }, &bf);
-                tcp_send(s^.server_conn, buffer_slice(&bf));
+                send_to_server(s, buffer_slice(&bf));
                 buffer_clear(&bf);
             }
         }
@@ -700,7 +744,6 @@ fn main() {
 }
 
 fn kill_state(s: ^State) {
-    mutex_destroy(&s^.state_mutex);
     tcp_shutdown(s^.server_conn, SHUT_RDWR);
     tcp_close(s^.server_conn);
     mutex_destroy(&s^.state_mutex);
