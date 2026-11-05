@@ -529,8 +529,8 @@ fn main(): i32 {
     s := new::<State>();
     mutex_init(&s^.state_mutex);
 
-    spawn(s, DEF_VILLAGER, EK_NPC, {4, 4}, FL_TALKABLE);
-    spawn(s, DEF_VILLAGER, EK_NPC, {6, 4}, FL_TALKABLE);
+    spawn(s, DEF_DUCK, EK_NPC, {4, 4}, FL_TALKABLE);
+    spawn(s, DEF_DUCK, EK_NPC, {6, 4}, FL_TALKABLE);
     spawn(s, DEF_SLIME, EK_HOSTILE, {10, 10}, FL_ATTACKABLE);
     spawn(s, DEF_SLIME, EK_HOSTILE, {12, 10}, FL_ATTACKABLE);
 

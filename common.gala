@@ -29,7 +29,7 @@ ENTITY_WIRE_SIZE :: 52;
 MAX_FRAME_BODY   :: 16 + ENTITY_WIRE_SIZE * MAX_ENTITIES;
 
 DEF_PLAYER  :: 0;
-DEF_VILLAGER :: 1;
+DEF_DUCK :: 1;
 DEF_SLIME   :: 2;
 
 EK_PLAYER  :: 0;
@@ -60,6 +60,19 @@ struct Entity {
     kind: int,
     def: int,
     hp: int,
+}
+
+struct Terrain {
+    model: Model,
+    pos: Vector2,
+}
+struct Building {
+    model: model,
+    center: Vector2,
+}
+struct WorldMap {
+    terrain: Terrain,
+    buildings: []Building,
 }
 
 fn empty_entity(): Entity {
@@ -405,7 +418,7 @@ fn unpack_message(
 }
 
 fn get_def(id: int): EntityDef {
-    if id == DEF_VILLAGER { return EntityDef{"duck", 20, 0.4, 1, 0.0}; }
+    if id == DEF_DUCK { return EntityDef{"duck", 20, 1.5, 1, 0.0}; }
     if id == DEF_SLIME    { return EntityDef{"slime", 10, 0.6, 2, 3.0}; }
     return EntityDef{"player", 100, 1.2, 0, 0.0};
 }
