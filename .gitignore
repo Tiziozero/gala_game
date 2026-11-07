@@ -4,3 +4,4 @@ client
 .gala_build
 assets
 terrain.obj
+gen_map

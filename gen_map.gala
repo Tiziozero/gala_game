@@ -1,7 +1,7 @@
-import "core/core.gala";
-import "core/mem.gala";
-import "core/cfunctions.gala";
-import "core/rl.gala";
+import "core/core_posix.gala";
+import "core/mem_posix.gala";
+import "core/cfunctions_posix.gala";
+import "core/rl_posix.gala";
 import "./noise.gala";
 
 SIZE := 255;
