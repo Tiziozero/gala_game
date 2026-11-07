@@ -20,6 +20,19 @@
 import "core/net_common.gala";
 import "./common.gala";
 
+struct Terrain {
+    model: ClientModel,
+    pos: Vector2,
+}
+struct Building {
+    model: ClientModel,
+    center: Vector2,
+}
+struct WorldMap {
+    terrain: Terrain,
+    buildings: []Building,
+    entities:   []Entity, // slice of entities in the world? later
+}
 
 // draw space inverts x axis. that only.
 I := Matrix { [16]f32{
@@ -55,6 +68,7 @@ struct State {
     server_entities:[1024]Entity,
     // own copy with prediction and what not blah blah blah
     entities:       [1024]Entity,
+    world:          WorldMap,
 
     frame_arena:    Arena,
     init_arena:     Arena,
@@ -375,18 +389,18 @@ fn load_shadow_map(w: i32, h: i32): RenderTexture2D {
 
 // draws everything that exists in the world. used for BOTH the depth pass and the real pass.
 // shadow_pass = true -> skip debug stuff, terrain uses the plain depth shader
-fn draw_scene(s: ^State, terrain: ^ClientModel, house, house2: ^ClientModel, models: []ClientModel,
-              terrain_shader: Shader, shadow_pass: bool) {
-    terrain^.model.materials[0].shader = terrain_shader;
-    DrawModel(terrain^.model, {TERRAIN_OFFSET, 0, TERRAIN_OFFSET}, 1, {40, 120, 40, 255});
+fn draw_scene(s: ^State, models: []ClientModel, terrain_shader: Shader, shadow_pass: bool) {
+    terrain := & s^.world.terrain;
+    terrain^.model.model.materials[0].shader = terrain_shader;
+    DrawModel(terrain^.model.model, {-terrain^.pos.x, 0, terrain^.pos.y}, 1, {40, 120, 40, 255});
 
     // only first "ecount" entities are relevant
     i := 0;
     while i < s^.ecount {
         e := s^.entities[i];
         gy := terrain_height(-e.pos.x, e.pos.y);
-        model := models[e.id%2].model;
-        scale := models[e.id%2].scale;
+        model := models[e.id%len(models)].model;
+        scale := models[e.id%len(models)].scale;
         model.transform = MatrixMultiply( I, MatrixRotateY(PI/2* e.d));
         DrawModel(model, {-e.pos.x, gy, e.pos.y}, scale, {255, 255, 255, 255});
         if !shadow_pass {
@@ -395,13 +409,18 @@ fn draw_scene(s: ^State, terrain: ^ClientModel, house, house2: ^ClientModel, mod
         }
         i += 1;
     }
-    // house
+    /*// house
     hy := terrain_height(0, 0);
     // DrawModel(house^.model, {0, hy + 1, 0}, 1, {255, 255, 255, 255});
     DrawModel(house2^.model, {0, hy + 1 + 2, 0}, 1, {255, 255, 255, 255});
-    DrawCircle3D({0, hy + 1 + 2, 0}, 0.15, {1, 0, 0}, 90, {255,0,0,255});
+    DrawCircle3D({0, hy + 1 + 2, 0}, 0.15, {1, 0, 0}, 90, {255,0,0,255}); */
 }
 
+fn load_world(s: ^State) {
+    terrain := load_client_model("terrain.obj", 1, arena_allocator(&s^.init_arena));
+    build_heights(terrain.model.meshes[0]);
+    s^.world.terrain = {terrain, {-TERRAIN_OFFSET, -TERRAIN_OFFSET}};
+}
 LIMIT :: 100;
 fn main() {
     // SetTraceLogLevel(LOG_WARNING);
@@ -456,8 +475,11 @@ fn main() {
     models := [10]ClientModel{
         // load_client_model("assets/B3.glb", 0.3, fa),
         load_client_model("duck.obj", 1,  fa),
-        load_client_model("duck.obj", 1,  fa),
+        load_client_model("assets/uru5.glb", 0.1,  fa),
+        load_client_model("assets/B3.glb", 0.25,  fa),
     };
+    load_world(s);
+    lm := 3;
     SetTargetFPS(60);
     rs := thread_spawn(receiver_loop, s);
 
@@ -482,12 +504,10 @@ fn main() {
     bf := buffer_wrap(sendb[:]);
     buffer_clear(&bf);
 
-    terrain := load_client_model("terrain.obj", 1, fa);
-    build_heights(terrain.model.meshes[0]);
     shader := LoadShader(clone_cstring("terrain.vs", fa), clone_cstring("terrain.fs", fa));
     shader.locs[SHADER_LOC_MATRIX_MODEL]  = GetShaderLocation(shader, clone_cstring("matModel", fa));
     shader.locs[SHADER_LOC_MATRIX_NORMAL] = GetShaderLocation(shader, clone_cstring("matNormal", fa));
-    terrain.model.materials[0].shader = shader;
+    s^.world.terrain.model.model.materials[0].shader = shader;
 
     // raylib's default shader, used for the depth-only pass
     depth_shader := LoadShader(0, 0);
@@ -515,10 +535,10 @@ fn main() {
     frame: f32 = 0;
     zoom: f32 = 5;
     self := empty_entity();
-    house := load_client_model("assets/house.glb", 50, allocator);
-    house2 := load_client_model("assets/house3.glb", 1, allocator);
     // input -> update state -> draw
     // input is based on previous state
+
+
     while !WindowShouldClose() && s^.on {
         // find self first and copy entities over
         i := 0;
@@ -678,7 +698,7 @@ fn main() {
         BeginMode3D(light_cam);
         light_view := rlGetMatrixModelview();
         light_proj := rlGetMatrixProjection();
-        draw_scene(s, &terrain, &house, &house2, models[:], depth_shader, true);
+        draw_scene(s, models[:lm], depth_shader, true);
         EndMode3D();
         EndTextureMode();
 
@@ -707,7 +727,7 @@ fn main() {
         // game itself
         BeginMode3D(camera);
         DrawGrid(20, 1.0);
-        draw_scene(s, &terrain, &house, &house2, models[:], shader, false);
+        draw_scene(s, models[:lm], shader, false);
         EndMode3D();
         rlActiveTextureSlot(0);
 
@@ -736,7 +756,7 @@ fn main() {
     for sound in sounds {
         UnloadSound(sound);
     }
-    for m in models[:2] {
+    for m in models[:lm] {
         UnloadModel(m.model);
     }
     kill_state(s);

@@ -62,18 +62,6 @@ struct Entity {
     hp: int,
 }
 
-struct Terrain {
-    model: Model,
-    pos: Vector2,
-}
-struct Building {
-    model: model,
-    center: Vector2,
-}
-struct WorldMap {
-    terrain: Terrain,
-    buildings: []Building,
-}
 
 fn empty_entity(): Entity {
     return {false, -1, {0, 0}, 0, 0, 0, 0, 0};

@@ -6,7 +6,7 @@ ifeq ($(OS),Windows_NT)
     RUN_CMD = .\$(1)$(EXE)
 else
     GALAC := galac
-    RAYLIB := ./lib/libraylib.so.600
+    RAYLIB := ./lib/libraylib.so.620
     EXE :=
     ABI := sysv
     RUN_CMD = LD_LIBRARY_PATH=./lib ./$(1)

@@ -45,6 +45,7 @@ struct State {
     ccount:         int,
     entities:       [MAX_ENTITIES]Entity,
     brains:         [MAX_ENTITIES]Brain,
+    world:          struct { a: int },
     on:             bool,
 }
 
